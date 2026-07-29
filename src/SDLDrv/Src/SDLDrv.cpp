@@ -7,6 +7,8 @@
 	[Engine.Engine] ViewportManager; NewViewport/OpenWindow/Tick from
 	UGameEngine), so no engine changes are needed. OpenGLDrv creates its GL
 	context from the SDL window (its UNREAL_USE_SDL path).
+
+	Author: Len Mudgett
 =============================================================================*/
 
 #include "SDLDrvPrivate.h"

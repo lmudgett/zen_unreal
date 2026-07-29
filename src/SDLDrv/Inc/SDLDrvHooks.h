@@ -5,6 +5,8 @@
 	engine: SDLDrv calls GSDLEventHook for every polled event; a nonzero
 	return means the hook consumed it (UI has focus) and the engine input
 	translation is skipped. SDL_EVENT_QUIT is always forwarded regardless.
+
+	Author: Len Mudgett
 =============================================================================*/
 
 #ifndef SDLDRV_API

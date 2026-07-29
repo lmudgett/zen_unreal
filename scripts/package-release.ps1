@@ -25,6 +25,9 @@
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File scripts\package-release.ps1
+
+.NOTES
+    Author: Len Mudgett
 #>
 [CmdletBinding()]
 param(

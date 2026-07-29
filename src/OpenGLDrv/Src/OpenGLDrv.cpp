@@ -19,6 +19,8 @@
 	* Textures arrive as palettized P8 or 32-bit RGBA mips; they are
 	  converted and uploaded on first use, keyed by the engine's 64-bit
 	  CacheID. Realtime textures (fire, water) re-upload when flagged.
+
+	Author: Len Mudgett
 =============================================================================*/
 
 #pragma warning( disable : 4201 )

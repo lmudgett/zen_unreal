@@ -12,6 +12,8 @@ REM  Run:  build-dist.bat   (double-click, or from a terminal in the repo root)
 REM  Needs Visual Studio 2022 and a configured build-sdl\ CMake tree
 REM  (cmake -S . -B build-sdl -DUNREAL_USE_SDL=ON). Does NOT reconfigure CMake;
 REM  if you edited CMakeLists.txt, run that cmake command once first.
+REM
+REM  Author: Len Mudgett
 REM ============================================================================
 setlocal enabledelayedexpansion
 cd /d "%~dp0"

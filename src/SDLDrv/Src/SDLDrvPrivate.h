@@ -6,6 +6,8 @@
 	runs on Linux/macOS as well as Windows. Selected via
 	[Engine.Engine] ViewportManager=SDLDrv.SDLClient. OpenGLDrv creates its
 	GL context from the SDL window (see its UNREAL_USE_SDL path).
+
+	Author: Len Mudgett
 =============================================================================*/
 
 #include "Engine.h"

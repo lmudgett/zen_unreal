@@ -2,6 +2,7 @@
 /build/
 /build-sdl/
 /dist/
+/Unreal - v200/
 
 # Runtime artifacts
 /Save/

@@ -6,6 +6,8 @@
 	the SDL launcher; it installs itself on the SDLDrv event hook and the
 	OpenGLDrv post-render hook, so the UI draws as an overlay on the SDL
 	window and takes input focus ahead of the engine when a panel wants it.
+
+	Author: Len Mudgett
 =============================================================================*/
 
 #ifndef _INC_EDGUI

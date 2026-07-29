@@ -14,6 +14,8 @@
 	(map load/save, undo/redo, edit modes, rebuild), log panel (tees off
 	Core's GLogHook), and an exec console. Ortho quad views, browsers, and
 	property panels come next.
+
+	Author: Len Mudgett
 =============================================================================*/
 
 #include "Engine.h"

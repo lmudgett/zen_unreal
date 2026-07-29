@@ -13,6 +13,8 @@
 	package (script, texture, sound, music, and all maps), the hardened
 	WAV parser against every retail sound, and script/bytecode presence
 	for the modernized bot classes.
+
+	Author: Len Mudgett
 =============================================================================*/
 
 #include "LaunchPrivate.h" // Engine.h (via) already includes UnAudio.h

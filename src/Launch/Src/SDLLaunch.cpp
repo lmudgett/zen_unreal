@@ -9,6 +9,8 @@
 	GLogHook (Unreal.log still receives everything). Keeps the -selftest /
 	-make / -server command paths and the 200fps frame-rate cap from the
 	Windows launcher.
+
+	Author: Len Mudgett
 =============================================================================*/
 
 #include "LaunchPrivate.h"

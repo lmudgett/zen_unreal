@@ -9,6 +9,8 @@
 #                          screenshot that must not be black.
 #   5. Audio             - system peak meter sampled during the rendered run.
 # Exit code = number of failed stages.
+#
+# Author: Len Mudgett
 param([switch]$SkipCompiler)
 $ErrorActionPreference = "Continue"
 $Root = Split-Path -Parent $PSScriptRoot

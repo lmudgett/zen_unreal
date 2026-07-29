@@ -4,6 +4,8 @@
 	Installs an unhandled-exception filter before WinMain runs and writes a
 	symbolized stack trace to Crash.txt next to the executable, using the
 	PDBs produced by the build. Port-debugging aid; harmless in release.
+
+	Author: Len Mudgett
 =============================================================================*/
 
 #define STRICT

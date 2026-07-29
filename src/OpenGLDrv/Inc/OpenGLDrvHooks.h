@@ -6,6 +6,8 @@
 	under UNREAL_USE_SDL, OpenGLDrv invokes GGLPostRenderHook right before
 	SDL_GL_SwapWindow, with the GL context current — the natural place for
 	an immediate-mode overlay. NULL when no UI overlay is installed.
+
+	Author: Len Mudgett
 =============================================================================*/
 
 #ifndef OPENGLDRV_API

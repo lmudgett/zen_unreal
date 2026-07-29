@@ -6,6 +6,8 @@
 # Requires [UnrealI.DeathMatchGame] bMultiPlayerBots=True and InitialBots>0
 # in System\Unreal.ini (bots only auto-spawn on a dedicated server when
 # bMultiPlayerBots is set).
+#
+# Author: Len Mudgett
 param(
     [string]$Map = "DmAriza.unr",
     [int]$Seconds = 150
