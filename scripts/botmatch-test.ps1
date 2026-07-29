@@ -1,10 +1,10 @@
 # Headless botmatch test harness (x64 port).
 # Runs a dedicated-server deathmatch with bots for a fixed duration, then
 # summarizes bot activity from the log. Use after editing bot scripts:
-#   1. Unreal.exe -make -remake=UnrealI          (rebuild scripts)
+#   1. ZenUnreal.exe -make -remake=UnrealI          (rebuild scripts)
 #   2. scripts\botmatch-test.ps1 [-Map DmAriza.unr] [-Seconds 150]
 # Requires [UnrealI.DeathMatchGame] bMultiPlayerBots=True and InitialBots>0
-# in System\Unreal.ini (bots only auto-spawn on a dedicated server when
+# in System\ZenUnreal.ini (bots only auto-spawn on a dedicated server when
 # bMultiPlayerBots is set).
 #
 # Author: Len Mudgett
@@ -15,8 +15,8 @@ param(
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $PSScriptRoot
 $SystemDir = Join-Path $Root "System"
-$Exe = Join-Path $SystemDir "Unreal.exe"
-$LogFile = Join-Path $SystemDir "Unreal.log"
+$Exe = Join-Path $SystemDir "ZenUnreal.exe"
+$LogFile = Join-Path $SystemDir "ZenUnreal.log"
 
 if (Test-Path $LogFile) { Remove-Item $LogFile }
 

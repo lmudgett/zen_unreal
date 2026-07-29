@@ -15,8 +15,8 @@ param([switch]$SkipCompiler)
 $ErrorActionPreference = "Continue"
 $Root = Split-Path -Parent $PSScriptRoot
 $SystemDir = Join-Path $Root "System"
-$Exe = Join-Path $SystemDir "Unreal.exe"
-$LogFile = Join-Path $SystemDir "Unreal.log"
+$Exe = Join-Path $SystemDir "ZenUnreal.exe"
+$LogFile = Join-Path $SystemDir "ZenUnreal.log"
 $Failed = 0
 
 function Stage([string]$Name, [bool]$Ok, [string]$Detail) {
@@ -44,15 +44,15 @@ if ($SkipCompiler) {
     if (Test-Path $SB) { Remove-Item $SB -Recurse -Force }
     New-Item -ItemType Directory -Force (Join-Path $SB "System") | Out-Null
     Copy-Item (Join-Path $SystemDir "*.dll") (Join-Path $SB "System")
-    Copy-Item (Join-Path $SystemDir "Unreal.exe") (Join-Path $SB "System")
-    Copy-Item (Join-Path $SystemDir "Unreal.ini") (Join-Path $SB "System")
+    Copy-Item (Join-Path $SystemDir "ZenUnreal.exe") (Join-Path $SB "System")
+    Copy-Item (Join-Path $SystemDir "ZenUnreal.ini") (Join-Path $SB "System")
     Copy-Item (Join-Path $SystemDir "*.int") (Join-Path $SB "System")
     Copy-Item (Join-Path $SystemDir "*.u") (Join-Path $SB "System")
     foreach ($pkg in @("Core","Engine","Editor","Fire","IpDrv","UnrealI")) {
         New-Item -ItemType Directory -Force (Join-Path $SB "src\$pkg") | Out-Null
         Copy-Item (Join-Path $Root "src\$pkg\Classes") (Join-Path $SB "src\$pkg\Classes") -Recurse
     }
-    $p = Start-Process -FilePath (Join-Path $SB "System\Unreal.exe") -ArgumentList '-make','-remake=UnrealI','-log' -WorkingDirectory (Join-Path $SB "System") -PassThru
+    $p = Start-Process -FilePath (Join-Path $SB "System\ZenUnreal.exe") -ArgumentList '-make','-remake=UnrealI','-log' -WorkingDirectory (Join-Path $SB "System") -PassThru
     if (-not $p.WaitForExit(300000)) { Stop-Process -Id $p.Id -Force; Stage "compiler" $false "(timeout)" }
     else {
         $elog = Join-Path $SB "System\Editor.log"
