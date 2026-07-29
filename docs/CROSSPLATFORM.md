@@ -127,9 +127,9 @@ means a full rewrite for no portability gain.
     quarantines the binary and tombstones the filename — `Unreal.exe` and
     `UnrealSDL.exe` are both currently unusable names (LNK1104 on relink).
     Verification used a renamed link (`msbuild Unreal.vcxproj
-    /p:TargetName=UnrealP4 /p:BuildProjectReferences=false` — the second
+    /p:TargetName=ZenUnreal /p:BuildProjectReferences=false` — the second
     flag is essential or Core/Engine also relink under the new name) with
-    beacon/uplink `ServerActors` blanked in `UnrealP4.ini` (the exe name
+    beacon/uplink `ServerActors` blanked in `ZenUnreal.ini` (the exe name
     selects `<name>.ini`/`<name>.log`). Until the repo is added to
     Norton's exclusions and the quarantined files restored, `Unreal.exe`
     cannot be linked by either config.
