@@ -1,0 +1,9 @@
+[Language]
+Language=English (International)
+
+[Public]
+Object=(Name=OpenGLDrv.OpenGLRenderDevice,Class=Class,MetaClass=Engine.RenderDevice,Autodetect=)
+Preferences=(Caption="OpenGL Rendering",Parent="Rendering",Class=OpenGLDrv.OpenGLRenderDevice,Immediate=True,Category=Options)
+
+[OpenGLRenderDevice]
+ClassCaption=OpenGL Rendering

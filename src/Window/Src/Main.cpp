@@ -1,0 +1,556 @@
+/*=============================================================================
+	Main.cpp: Unreal main startup/shutdown code.
+	Copyright 1997 Epic MegaGames, Inc. This software is a trade secret.
+
+Revision history:
+	* Created by Tim Sweeney.
+=============================================================================*/
+
+#pragma warning( disable : 4201 )
+#define STRICT
+#include <windows.h>
+#include <commctrl.h>
+#include "Engine.h"
+#include "UnRender.h"
+#include "Window.h"
+
+/*-----------------------------------------------------------------------------
+	Globals.
+-----------------------------------------------------------------------------*/
+
+extern CORE_API FGlobalPlatform GTempPlatform;
+WINDOW_API WLog* GLog=NULL;
+WINDOW_API UBOOL GTickDue=0;
+
+/*-----------------------------------------------------------------------------
+	Exec hook.
+-----------------------------------------------------------------------------*/
+
+// FExecHook.
+class FExecHook : public FExec
+{
+	UBOOL Exec( const char* Cmd, FOutputDevice* Out )
+	{
+		if( ParseCommand(&Cmd,"SHOWLOG") )
+		{
+			if( GLog )
+			{
+				ShowWindow( *GLog, SW_SHOW );
+				SetFocus( *GLog );
+			}
+			return 1;
+		}
+		else if( ParseCommand(&Cmd,"EDITACTOR") )
+		{
+			UClass* Class;
+			FLOAT MinDist=999999.0;
+			TObjectIterator<UEngine> EngineIt;
+			if
+			(	EngineIt
+			&&	EngineIt->Client
+			&&	EngineIt->Client->Viewports.Num()
+			&&	ParseObject<UClass>( Cmd, "CLASS=", Class, ANY_PACKAGE ) )
+			{
+				AActor* Player  = EngineIt->Client->Viewports(0)->Actor;
+				AActor* Found   = NULL;
+				FLOAT   MinDist = 999999.0;
+				for( TObjectIterator<AActor> It; It; ++It )
+				{
+					FLOAT Dist=FDist(It->Location,Player->Location);
+					if
+					(	It->XLevel==Player->XLevel
+					&&	It->IsA( Class )
+					&&	Dist<MinDist )
+					{
+						MinDist = Dist;
+						Found   = *It;
+					}
+				}
+				if( Found )
+				{
+					WObjectProperties* P = new WObjectProperties( "EditActor", 0, "" );
+					P->OpenWindow();
+					P->Root.SetObjects( (UObject**)&Found, 1 );
+					ShowWindow( *P, SW_SHOW );
+				}
+				else Out->Logf( "Actor not found" );
+			}
+			else Out->Logf( "Missing class" );
+			return 1;
+		}
+		else if( ParseCommand(&Cmd,"HIDELOG") )
+		{
+			if( GLog )
+				ShowWindow( *GLog, SW_HIDE );
+			return 1;
+		}
+		/*else if( ParseCommand(&Cmd,"GENPASS") )
+		{
+			char Name[256];
+			UBOOL CheckPassword( const char* Name, const char* Password );
+			if( Parse( Cmd, "NAME=", Name, sizeof(Name) ) )
+			{
+				debugf( NAME_Log, "Generating..." );
+				while( 1 )
+				{
+					char Password[16];
+					for( int i=0; i<15; i++ )
+					{
+						int R = rand() % 36;
+						Password[i] = R<10 ? '0'+R : 'A'-10+R;
+					}
+					Password[i]=0;
+					if( CheckPassword( Name, Password ) )
+					{
+						Out->Logf( "Password: %s", Password );
+						break;
+					}
+				}
+			}
+			else Out->Log( "Missing name" );
+			return 1;
+		}*/
+		else return 0;
+	}
+};
+FExecHook GLocalHook;
+WINDOW_API FExec* GThisExecHook = &GLocalHook;
+
+/*-----------------------------------------------------------------------------
+	Passwords.
+-----------------------------------------------------------------------------*/
+
+// Check password.
+/*WINDOW_API UBOOL CheckPassword( const char* Name, const char* Password )
+{
+	char Mash[256];
+	if( stricmp( Password, "LTQ0XX0O7I74IG8" )==0 )
+		return 0;
+	if( stricmp( Password, "DJ4ECRDCIABCG7R" )==0 )
+		return 0;
+	appSprintf( Mash,"ss%ss%ss", Name, Password );
+	strupr(Mash);
+	return (appMemCrc((BYTE*)Mash,strlen(Mash))&0xffffff)==0x6ab2de;
+}*/
+
+/*-----------------------------------------------------------------------------
+	Registration.
+-----------------------------------------------------------------------------*/
+
+// Not guarded.
+static void RegDoSet( HKEY Key, FString Value )
+{
+	RegSetValue( Key, "", REG_SZ, *Value, Value.Length() );
+}
+
+// Not guarded.
+static void RegSetEx( HKEY Key, FString SubKey, FString Value )
+{
+	RegSetValueEx(Key,*SubKey,0,REG_SZ,(BYTE*)*Value,Value.Length());
+}
+
+static const char* ReadConfig( const char* Key, const char* Section="Registry" )
+{
+	static char Result[256];
+	*Result = 0;
+	GetConfigString( Section, Key, Result, ARRAY_COUNT(Result) );
+	return Result;
+}
+
+// Not guarded.
+WINDOW_API void RegisterFileTypes()
+{
+	FString Base(appBaseDir());
+	HKEY Key1, Key2, Key3, Key4;
+
+	// Register .unr.
+	RegCreateKey				(HKEY_CLASSES_ROOT,*(FString(".")+ReadConfig("MapExt","URL")), &Key1);
+		RegDoSet				(Key1,ReadConfig("OleMapType"));
+	RegCloseKey					(Key1);
+
+	// Register Unreal.Map.
+	RegCreateKey				(HKEY_CLASSES_ROOT,ReadConfig("OleMapType"),&Key1);
+		RegDoSet				(Key1,ReadConfig("OleMapDescription"));
+		RegCreateKey			(Key1,"DefaultIcon",&Key2);
+			RegDoSet			(Key2,Base + appPackage() + ".exe,0");
+		RegCloseKey				(Key2);
+		RegCreateKey			(Key1,"shell",&Key2);
+			RegDoSet			(Key2,"open");
+			RegCreateKey		(Key2,"open",&Key3);
+				RegDoSet		(Key3,Localize("Windows","PlayCommand",appPackage()));
+				RegCreateKey	(Key3,"command",&Key4);
+					RegDoSet	(Key4,Base + appPackage() + ".exe \"%1\"");
+				RegCloseKey		(Key4);
+			RegCloseKey			(Key3);
+			if( appFSize(GetConfigStr("Registry","EditorApp"))>0 )
+			{
+				RegCreateKey	(Key2,"edit",&Key3);
+					RegDoSet	(Key3,Localize("Windows","EditCommand",appPackage()));
+					RegCreateKey(Key3,"command",&Key4);
+						RegDoSet(Key4,Base + GetConfigStr("Registry","EditorApp") + " FILE=\"%1\"");
+					RegCloseKey	(Key4);
+				RegCloseKey		(Key3);
+			}
+		RegCloseKey				(Key2);
+	RegCloseKey					(Key1);
+
+	// Register unreal protocol with Internet Explorer.
+	RegCreateKey				(HKEY_CLASSES_ROOT,ReadConfig("Protocol","Url"),&Key1);
+		RegDoSet				(Key1,FString("URL:")+ReadConfig("ProtocolDescription","Url"));
+		RegCreateKey			(Key1,"DefaultIcon",&Key2);
+			RegDoSet			(Key2,Base + appPackage() + ".exe");
+		RegCloseKey				(Key2);
+		RegSetEx				(Key1,"URL Protocol","");
+		RegCreateKey			(Key1,"shell",&Key2);
+			RegDoSet			(Key2,"open");
+			RegCreateKey		(Key2,"open",&Key3);
+				RegDoSet		(Key3,Localize("Windows","PlayCommand",appPackage()));
+				RegCreateKey	(Key3,"command",&Key4);
+					RegDoSet	(Key4,Base + appPackage() + ".exe \"%1\"");
+				RegCloseKey		(Key4);
+			RegCloseKey			(Key3);
+		RegCloseKey				(Key2);
+	RegCloseKey					(Key1);
+}
+
+/*-----------------------------------------------------------------------------
+	Startup and shutdown.
+-----------------------------------------------------------------------------*/
+
+//
+// Handle an error.
+//
+WINDOW_API void HandleError()
+{
+	GIsGuarded=0;
+	GIsCriticalError=1;
+	debugf( NAME_Exit, "Shutting down after catching exception" );
+	GObj.ShutdownAfterError();
+	debugf( NAME_Exit, "Exiting due to exception" );
+	GErrorHist[ARRAY_COUNT(GErrorHist)-1]=0;
+	MessageBox( NULL, GErrorHist, LocalizeError("Critical"), MB_OK|MB_ICONERROR|MB_TASKMODAL );
+}
+
+//
+// Initialize.
+//
+UEngine* InitEngine()
+{
+	guard(InitEngine);
+
+	// Create mutex so installer knows we're running.
+	CreateMutex( NULL, 0, "UnrealIsRunning" );
+
+	// Platform init.
+	appInit();
+	RegisterFileTypes();
+	GDynMem.Init( 65536 );
+
+	// Check password.
+	/*char Name[256]="", Password[256]="";
+	GetConfigString( "Login", "Name",     Name,     sizeof(Name    ), "UnPass.ini" );
+	GetConfigString( "Login", "Password", Password, sizeof(Password), "UnPass.ini" );
+	if( !CheckPassword( Name, Password ) )
+	{
+		WPasswordDialog Dlg;
+		if( Dlg.DoModal() )
+		{
+			if( CheckPassword( *Dlg.ResultName, *Dlg.ResultPassword ) )
+			{
+				SetConfigString( "Login", "Name",     *Dlg.ResultName,     "UnPass.ini"  );
+				SetConfigString( "Login", "Password", *Dlg.ResultPassword, "UnPass.ini"  );
+			}
+			else
+			{
+				MessageBox( NULL, LocalizeError("Password","Core"), "Failure", MB_OK );
+				ExitProcess( 0 );
+			}
+		}
+		else ExitProcess( 0 );
+	}*/
+
+	// Init subsystems.
+	GSceneMem.Init( 32768 );
+
+	// First-run menu.
+	UBOOL FirstRun=0;
+	GetConfigBool( "FirstRun", "FirstRun", FirstRun );
+	if
+	(	(FirstRun || ParseParam(appCmdLine(),"FirstRun"))
+	&&	!GIsEditor 
+	&&	GIsClient )
+	{
+		// Get system directory.
+		char SysDir[256]="", WinDir[256]="";
+		GetSystemDirectory( SysDir, ARRAY_COUNT(SysDir) );
+		GetWindowsDirectory( WinDir, ARRAY_COUNT(WinDir) );
+
+		// Low memory detection.
+		if( GPhysicalMemory <= 24*1024*1024 )
+		{
+			char Temp[4096];
+			appSprintf( Temp, Localize("FirstRun","LowMemory"), GPhysicalMemory/1024/1024 );
+			::MessageBox( NULL, Temp, Localize("FirstRun","Caption"), MB_OK|MB_ICONINFORMATION|MB_TASKMODAL );
+			SetConfigBool( "Galaxy.GalaxyAudioSubsystem", "LowSoundQuality", 1 );
+			SetConfigBool( "WinDrv.WindowsClient", "LowDetailTextures", 1 );
+		}
+
+		// MMX detection.
+		if( !GIsMMX )
+		{
+			::MessageBox( NULL, Localize("FirstRun","NonMMX"), Localize("FirstRun","Caption"), MB_OK|MB_ICONINFORMATION|MB_TASKMODAL );
+			SetConfigString( "Galaxy.GalaxyAudioSubsystem", "OutputRate", "11025Hz" );
+		}
+
+		// Low res detection.
+		if( !GIsMMX || !GIsPentiumPro )
+		{
+			SetConfigString( "WinDrv.WindowsClient", "ViewportX", "320" );
+			SetConfigString( "WinDrv.WindowsClient", "ViewportY", "240" );
+		}
+
+		// Autodetect and ask about detected render devices.
+		static TArray<FRegistryObjectInfo> RenderDevices;
+		GObj.GetRegistryObjects( RenderDevices, UClass::StaticClass, URenderDevice::StaticClass, 0 );
+		for( INT i=0; i<RenderDevices.Num(); i++ )
+		{
+			char File1[256], File2[256];
+			appSprintf( File1, "%s\\%s", SysDir, RenderDevices(i).Autodetect );
+			appSprintf( File2, "%s\\%s", WinDir, RenderDevices(i).Autodetect );
+			if( *RenderDevices(i).Autodetect && (appFSize(File1)>=0 || appFSize(File2)>=0) )
+			{
+				char Path[256], *Str;
+				appStrcpy( Path, RenderDevices(i).Object );
+				Str = appStrstr(Path,".");
+				if( Str )
+				{
+					*Str++ = 0;
+					if( ::MessageBox( NULL, Localize(Str,"AskInstalled",Path), Localize("FirstRun","Caption"), MB_YESNO|MB_ICONQUESTION|MB_TASKMODAL )==IDYES )
+					{
+						if( ::MessageBox( NULL, Localize(Str,"AskUse",Path), Localize("FirstRun","Caption"), MB_YESNO|MB_ICONQUESTION|MB_TASKMODAL )==IDYES )
+						{
+							SetConfigString( "Engine.Engine", "GameRenderDevice", RenderDevices(i).Object );
+							SetConfigString( "SoftDrv.SoftwareRenderDevice", "HighDetailActors", "True" );
+							break;
+						}
+					}
+				}
+			}
+		}
+
+		// Display first-run message.
+		::MessageBox( NULL, Localize("FirstRun","Starting"), Localize("FirstRun","Caption"), MB_OK|MB_ICONINFORMATION|MB_TASKMODAL );
+		SetConfigBool( "FirstRun", "FirstRun", 0 );
+	}
+	// x64 port: the original engine blocked here until the Unreal CD-ROM was
+	// present (it probed CdPath\Textures\Palettes.utx and looped on a "Cd
+	// Required At Startup" dialog). This port installs the retail content
+	// locally under content\, so there is no CD to require — the check is
+	// removed. CdPath had no other consumer in the engine.
+
+	// Create the global engine object.
+	UClass* EngineClass;
+	if( !GIsEditor )
+	{
+		// Create game engine.
+		EngineClass = GObj.LoadClass( UGameEngine::StaticClass, NULL, "ini:Engine.Engine.GameEngine", NULL, LOAD_NoFail | LOAD_KeepImports, NULL );
+	}
+	else if( ParseParam( appCmdLine(),"MAKE" ) )
+	{
+		// Create editor engine.
+		EngineClass = GObj.LoadClass( UEngine::StaticClass, NULL, "ini:Engine.Engine.EditorEngine", NULL, LOAD_NoFail | LOAD_DisallowFiles | LOAD_KeepImports, NULL );
+	}
+	else
+	{
+		// Editor.
+		EngineClass = GObj.LoadClass( UEngine::StaticClass, NULL, "ini:Engine.Engine.EditorEngine", NULL, LOAD_NoFail | LOAD_KeepImports, NULL );
+	}
+
+	// Init engine.
+	UEngine* Engine = ConstructClassObject<UEngine>( EngineClass );
+	Engine->Init();
+
+	// Hide the log.
+	if
+	(	!ParseParam(appCmdLine(),"LOG")
+	&&	!ParseParam(appCmdLine(),"SERVER")
+	&&	!ParseParam(appCmdLine(),"EDITOR")
+	&&	!ParseParam(appCmdLine(),"MAKE") )
+		ShowWindow( *GLog, SW_HIDE );
+
+	return Engine;
+
+	unguard;
+}
+
+//
+// Unreal's main message loop.  All windows in Unreal receive messages
+// somewhere below this function on the stack.
+//
+WINDOW_API void MainLoop( UEngine* Engine )
+{
+	guard(MainLoop);
+	if( GLog )
+		GLog->SetExec( Engine );
+	GIsRunning = 1;
+	DWORD ThreadId = GetCurrentThreadId();
+	HANDLE hThread = GetCurrentThread();
+	DOUBLE OldTime = appSeconds();
+	// x64 port: -framestats logs per-frame timing (spikes >25ms immediately,
+	// distribution every 5s) to diagnose stutter reports.
+	UBOOL FrameStats = ParseParam( appCmdLine(), "FRAMESTATS" );
+	// x64 port: frame-rate cap, default 200. The 1998 physics float math
+	// degenerates below ~2ms deltas (divisions like (Location-OldLocation)/
+	// (deltaTime-remainingTime) go astronomic, then NaN — reproduced as bot
+	// pawns NaN'ing at ~1000 fps with vsync off). 200 fps keeps deltas at
+	// 5 ms, comfortably inside the engine's designed regime; the same cap is
+	// used by the surviving community UE1 patches. Set
+	// [Engine.Engine] FrameRateLimit=0 to uncap for experiments.
+	FLOAT MinFrameTime = 1.f/200.f;
+	{
+		char Limit[32]="";
+		if( GetConfigString( "Engine.Engine", "FrameRateLimit", Limit, ARRAY_COUNT(Limit) ) )
+		{
+			INT Fps = appAtoi( Limit );
+			if( Fps > 0 )
+				MinFrameTime = 1.f/Fps;
+			else
+				MinFrameTime = 0.f;
+		}
+	}
+	timeBeginPeriod( 1 );
+	DOUBLE StatWindowStart = OldTime;
+	INT   StatFrames = 0, StatSpikes = 0;
+	DOUBLE StatMax = 0.0, StatSum = 0.0;
+	DOUBLE PrevTick = 0.0, PrevPump = 0.0, TickSum = 0.0;
+	while( GIsRunning && !GIsRequestingExit )
+	{
+		// Update the world.
+		DOUBLE NewTime = appSeconds();
+		DOUBLE FrameDelta = NewTime - OldTime;
+		// x64 port: -framestats — FrameDelta closes the PREVIOUS iteration, so
+		// report it against that iteration's tick/pump split (PrevTick/PrevPump).
+		if( FrameStats )
+		{
+			StatFrames++; StatSum += FrameDelta; StatMax = Max( StatMax, FrameDelta ); TickSum += PrevTick;
+			if( FrameDelta > 0.025 )
+			{
+				StatSpikes++;
+				debugf( "FrameStats: spike frame=%.1fms tick=%.1fms pump=%.1fms", FrameDelta*1000.0, PrevTick*1000.0, PrevPump*1000.0 );
+			}
+			if( NewTime - StatWindowStart > 5.0 )
+			{
+				debugf( "FrameStats: %i frames avg=%.1fms tickavg=%.1fms max=%.1fms spikes(>25ms)=%i", StatFrames, StatFrames ? StatSum*1000.0/StatFrames : 0.0, StatFrames ? TickSum*1000.0/StatFrames : 0.0, StatMax*1000.0, StatSpikes );
+				StatWindowStart = NewTime; StatFrames = 0; StatSpikes = 0; StatMax = 0.0; StatSum = 0.0; TickSum = 0.0;
+			}
+		}
+		Engine->Tick( NewTime - OldTime );
+		OldTime = NewTime;
+		if( FrameStats )
+			PrevTick = appSeconds() - NewTime;
+
+		// Enforce optional maximum tick rate.
+		INT MaxTickRate = Engine->GetMaxTickRate();
+		if( MaxTickRate )
+		{
+			FLOAT Delta = (1.0/MaxTickRate) - (appSeconds()-OldTime);
+			if( Delta > 0.0 )
+				Sleep( Delta * 1000 );
+		}
+
+		// Handle all incoming messages.
+		MSG Msg;
+		GTickDue = 0;
+		DOUBLE PumpStart = FrameStats ? appSeconds() : 0.0;
+		INT PumpMsgs = 0;
+		while( !GTickDue && PeekMessage( &Msg, NULL, 0, 0, PM_REMOVE ) )
+		{
+			if( Msg.message == WM_QUIT )
+				GIsRequestingExit = 1;
+			TranslateMessage( &Msg );
+			// x64 port: -framestats — attribute pump time to individual messages.
+			if( FrameStats )
+			{
+				PumpMsgs++;
+				DOUBLE T0 = appSeconds();
+				DispatchMessage( &Msg );
+				DOUBLE T1 = appSeconds();
+				if( T1-T0 > 0.010 )
+					debugf( "FrameStats: msg 0x%04X took %.1fms", Msg.message, (T1-T0)*1000.0 );
+			}
+			else
+				DispatchMessage( &Msg );
+		}
+		if( FrameStats )
+		{
+			PrevPump = appSeconds() - PumpStart;
+			static DOUBLE PumpSum = 0.0; static INT PumpFrames = 0, PumpMsgSum = 0;
+			PumpSum += PrevPump; PumpFrames++; PumpMsgSum += PumpMsgs;
+			if( PumpFrames == 300 )
+			{
+				debugf( "FrameStats: pump avg=%.2fms msgs/frame=%.1f", PumpSum*1000.0/PumpFrames, (FLOAT)PumpMsgSum/PumpFrames );
+				PumpSum = 0.0; PumpFrames = 0; PumpMsgSum = 0;
+			}
+		}
+
+		// If editor thread doesn't have the focus, don't suck up too much CPU time.
+		if( GIsEditor )
+		{
+			static UBOOL HadFocus=1;
+			UBOOL HasFocus = (GetWindowThreadProcessId(GetForegroundWindow(),NULL) == ThreadId );
+			if( HadFocus && !HasFocus )
+			{
+				// Drop our priority to speed up whatever is in the foreground.
+				SetThreadPriority( hThread, THREAD_PRIORITY_BELOW_NORMAL );
+			}
+			else if( HasFocus && !HadFocus )
+			{
+				// Boost our priority back to normal.
+				SetThreadPriority( hThread, THREAD_PRIORITY_NORMAL );
+			}
+			if( !HasFocus )
+			{
+				// Surrender the rest of this timeslice.
+				Sleep(0);
+			}
+			HadFocus = HasFocus;
+		}
+
+		// x64 port: frame-rate cap (see MinFrameTime above) — sleep the bulk
+		// at 1 ms granularity (timeBeginPeriod), spin the sub-2ms tail.
+		if( MinFrameTime > 0.f )
+		{
+			while( appSeconds() - OldTime < MinFrameTime )
+			{
+				if( MinFrameTime - (appSeconds() - OldTime) > 0.002 )
+					Sleep( 1 );
+			}
+		}
+	}
+	timeEndPeriod( 1 );
+	GIsRunning = 0;
+	if( GLog )
+		GLog->SetExec( NULL );
+	unguard;
+}
+
+//
+// Exit the engine.
+//
+void ExitEngine( UEngine* Engine )
+{
+	guard(ExitEngine);
+
+	GObj.Exit();
+	GMem.Exit();
+	GDynMem.Exit();
+	GSceneMem.Exit();
+	GCache.Exit(1);
+	appDumpAllocs( &GTempPlatform );
+
+	unguard;
+}
+
+/*-----------------------------------------------------------------------------
+	The End.
+-----------------------------------------------------------------------------*/
