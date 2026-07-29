@@ -2,6 +2,8 @@
 /build/
 /build-sdl/
 /dist/
+
+# Reference baseline (read-only, local-only; scrubbed from git history)
 /Unreal - v200/
 
 # Runtime artifacts
@@ -18,5 +20,6 @@ Crash.txt
 .vs/
 *.user
 
-# Local backup of the pre-GitHub git history (delete after push is verified)
+# Local git-history backups (delete after push is verified)
 /.git-backup-pre-github/
+/.git-backup-scrub/
