@@ -9,7 +9,7 @@ all of which are already portable C++.
 Chosen stack (decided 2026-07-23): **SDL** for windowing + input +
 GL-context + dynamic-library loading + timing, **a portable audio backend**
 (OpenAL or miniaudio) behind the existing Galaxy interface, and **Dear
-ImGui** for the editor UI that replaces the retired Visual Basic shell.
+ImGui** for the editor UI that replaces the retired original shell.
 This keeps everything already built and adds Linux/macOS as targets. .NET
 was rejected: .NET Framework is Windows-only (it would *prevent*
 cross-platform) and hosting a 121k-line C++ engine on a managed runtime
@@ -144,7 +144,7 @@ means a full rewrite for no portability gain.
     config to force correct relinks (check: the SDL variants import
     SDL3.dll).
 - **Phase 5 — ImGui editor (MILESTONE 1 DONE 2026-07-24; in progress).**
-  Cross-platform UnrealEd replacing the VB shell, driving the existing
+  Cross-platform UnrealEd replacing the legacy shell, driving the existing
   C++ editor backend through its original contract (Exec strings, topic
   Get/Set, EdCallback codes) with the Win32 transport removed.
   - **Architecture**: Dear ImGui v1.91.5-docking vendored via FetchContent
@@ -178,7 +178,7 @@ means a full rewrite for no portability gain.
     is read directly from the ini in `UEditorEngine::Init` (the config
     property never populates on the intrinsic class); (3) viewports must
     pass `SHOW_NoButtons` — `UEditorEngine::Draw` unconditionally calls
-    `DrawButtons`, which derefs 1998 toolbar textures only the VB shell
+    `DrawButtons`, which derefs 1998 toolbar textures only the old shell
     loaded (AV; ImGui is the toolbar now).
   - **Milestone 2 (DONE 2026-07-24) — selection → properties pipeline**:
     new Core hook `GEdCallbackHook` (beside GLogHook/GExecHook; EdHook's

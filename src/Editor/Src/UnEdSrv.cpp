@@ -2,10 +2,9 @@
 	UnEdSrv.cpp: UEditorEngine implementation, the Unreal editing server
 	Copyright 1997 Epic MegaGames, Inc. This software is a trade secret.
 
-	What's happening: When the Visual Basic level editor is being used,
-	this code exchanges messages with Visual Basic.  This lets Visual Basic
-	affect the world, and it gives us a way of sending world information back
-	to Visual Basic.
+	What's happening: the level-editor frontend drives this code with exec
+	commands and topic queries.  This lets the editor UI affect the world,
+	and it gives us a way of sending world information back to the UI.
 
 	Revision history:
 		* Created by Tim Sweeney

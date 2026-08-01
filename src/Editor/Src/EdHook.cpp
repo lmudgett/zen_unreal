@@ -392,7 +392,7 @@ void UEditorEngine::EdCallback( DWORD Code, UBOOL Send )
 {
 	guard(FGlobalPlatform::EdCallback);
 	// cross-platform port (Phase 5): the ImGui shell registers an in-process
-	// hook instead of the VB shell's window-message transport.
+	// hook instead of the legacy window-message transport.
 	if( GEdCallbackHook )
 		(*GEdCallbackHook)( Code, Send );
 	if( hWndCallback )

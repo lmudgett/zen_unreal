@@ -91,7 +91,7 @@ CORE_API extern FOutputDevice*			GLogHook;
 CORE_API extern FExec*					GExecHook;
 // Cross-platform port (Phase 5): in-process editor-notification hook. The
 // editor engine's EdCallback historically PostMessage'd EDC_* codes to the
-// VB shell's window; the ImGui shell registers this instead (lives in Core
+// frontend's window; the ImGui shell registers this instead (lives in Core
 // beside hWndCallback so Editor and the UI need no new link dependency).
 CORE_API extern void					(*GEdCallbackHook)( DWORD Code, UBOOL Send );
 CORE_API extern USystem*				GSys;

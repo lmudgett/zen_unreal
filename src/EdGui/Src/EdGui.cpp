@@ -1,11 +1,11 @@
 /*=============================================================================
 	EdGui.cpp: Dear ImGui editor frame (cross-platform port, Phase 5).
 
-	The portable UnrealEd shell replacing the retired Visual Basic frontend.
+	The portable UnrealEd shell replacing the retired original frontend.
 	Runs in-process on the SDL window: SDLDrv's GSDLEventHook feeds ImGui
 	first (UI panels take input focus ahead of the engine), and OpenGLDrv's
 	GGLPostRenderHook draws the UI over the finished frame before the swap.
-	The editor engine is driven exactly the way the VB shell drove it — by
+	The editor engine is driven exactly the way the old shell drove it — by
 	UEditorEngine::Exec strings (CAMERA/MAP/MODE/BRUSH/TRANSACTION/...); the
 	exec/topic/EdCallback contract is unchanged, only the transport (Win32
 	window messages) is gone.
@@ -82,7 +82,7 @@ static DWORD	GPendingPopup	= 0;
 
 // Selection state, refreshed when the editor fires EDC_SelChange /
 // EDC_MapChange through GEdCallbackHook (the in-process replacement for the
-// VB shell's PostMessage transport).
+// legacy PostMessage transport).
 static bool						GSelDirty = true;
 static std::vector<AActor*>		GSelected;
 
@@ -1217,7 +1217,7 @@ void EdGuiInstall( UEngine* InEngine )
 	// Standard3V first (it hosts the ImGui frame; index 0 = the window whose
 	// close quits), then top/front/side orthos. All realtime so the client
 	// repaints them every frame; SHOW_NoButtons is required: DrawButtons
-	// draws the 1998 viewport toolbar from textures only the VB shell loaded
+	// draws the 1998 viewport toolbar from textures only the old shell loaded
 	// (NULL deref); ImGui is the toolbar now.
 	char Cmd[256];
 	DWORD PerspFlags = SHOW_Frame|SHOW_Backdrop|SHOW_Actors|SHOW_Brush|SHOW_MovingBrushes|SHOW_StandardView|SHOW_RealTime|SHOW_NoButtons;
