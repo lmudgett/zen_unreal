@@ -9,19 +9,23 @@ var() localized string[32] RestartString;
 
 function bool ProcessSelection()
 {
+	local int Slot;
+
 	if ( Selection == 1 )
 	{
-		PlayerOwner.ReStartLevel(); 
+		PlayerOwner.ReStartLevel();
 		return true;
 	}
-	if ( SlotNames[Selection - 2] ~= "..Empty.." )
+	// Selection is a display position (newest first); resolve the real slot.
+	Slot = SlotOrder[Selection - 2];
+	if ( SlotNames[Slot] ~= "..Empty.." )
 		return false;
 	bExitAllMenus = true;
 	PlayerOwner.ClientMessage("");
-	if ( Left(SlotNames[Selection - 2], 4) == "Net:" )
-		Level.ServerTravel( "?load=" $ (Selection - 2), false);
+	if ( Left(SlotNames[Slot], 4) == "Net:" )
+		Level.ServerTravel( "?load=" $ Slot, false);
 	else
-		PlayerOwner.ClientTravel( "?load=" $ (Selection - 2), TRAVEL_Absolute, false);
+		PlayerOwner.ClientTravel( "?load=" $ Slot, TRAVEL_Absolute, false);
 	return true;
 }
 
@@ -48,7 +52,7 @@ function DrawSlots(canvas Canvas)
 	For ( i=1; i<10; i++ )
 	{
 		Canvas.SetPos(StartX, StartY + i * Spacing );
-		Canvas.DrawText(SlotNames[i-1], False);
+		Canvas.DrawText(SlotNames[SlotOrder[i-1]], False);
 	}
 
 	// show selection

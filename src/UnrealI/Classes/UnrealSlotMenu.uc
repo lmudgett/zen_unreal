@@ -6,7 +6,36 @@ class UnrealSlotMenu expands UnrealMenu
 	localized;
 
 var globalconfig string[100] SlotNames[9];
+var globalconfig int SaveTimes[9];	// minutes-resolution save stamp, 0 = never saved
+var int SlotOrder[9];				// display order: newest save first, empties last
 var localized string[16] MonthNames[12];
+
+function BeginPlay()
+{
+	Super.BeginPlay();
+	BuildSlotOrder();
+}
+
+// Sort the display order newest-save-first; empty slots (stamp 0) sink to the
+// end. Stable, so configs from before SaveTimes existed keep their slot order.
+function BuildSlotOrder()
+{
+	local int i, j, t;
+
+	For ( i=0; i<9; i++ )
+		SlotOrder[i] = i;
+	For ( i=1; i<9; i++ )
+	{
+		t = SlotOrder[i];
+		j = i - 1;
+		While ( (j >= 0) && (SaveTimes[SlotOrder[j]] < SaveTimes[t]) )
+		{
+			SlotOrder[j+1] = SlotOrder[j];
+			j--;
+		}
+		SlotOrder[j+1] = t;
+	}
+}
 
 function DrawSlots(canvas Canvas)
 {
@@ -20,7 +49,7 @@ function DrawSlots(canvas Canvas)
 	For ( i=1; i<10; i++ )
 	{
 		Canvas.SetPos(StartX, StartY + i * Spacing );
-		Canvas.DrawText(SlotNames[i-1], False);
+		Canvas.DrawText(SlotNames[SlotOrder[i-1]], False);
 	}
 
 	// show selection
