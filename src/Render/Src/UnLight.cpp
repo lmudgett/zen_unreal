@@ -1808,7 +1808,13 @@ static void global_Pulse( AActor* Owner, FLOAT& Brightness, FVector& Color )
 static void global_Blink( AActor* Owner, FLOAT& Brightness, FVector& Color )
 {
 	guardSlow(global_Blink);
-	if( (int)((Owner->Level->TimeSeconds * 35.0 * 65536.0)/(Owner->LightPeriod+1) + (Owner->LightPhase << 8)) & 1 )
+	// x64 port: the parity counter flips ~69kHz for default LightPeriod, so the
+	// result is effectively a fresh random on/off per SAMPLE -- per rendered
+	// frame in retail (~30-60Hz blink), per 200fps frame here, which the eye
+	// fuses into steady half-bright. Sample on the 35Hz server-tick grid so it
+	// blinks at the original rate.
+	FLOAT Time = (DWORD)(Owner->Level->TimeSeconds * 35.0) / 35.0f;
+	if( (int)((Time * 35.0 * 65536.0)/(Owner->LightPeriod+1) + (Owner->LightPhase << 8)) & 1 )
 		Brightness = 0.0;
 	unguardSlow;
 }
@@ -1828,10 +1834,14 @@ static void global_Flicker( AActor* Owner, FLOAT& Brightness, FVector& Color )
 static void global_Strobe( AActor* Owner, FLOAT& Brightness, FVector& Color )
 {
 	guardSlow(global_Strobe);
-	static float LastUpdateTime=0; static int Toggle=0;
-	if( LastUpdateTime != Owner->Level->TimeSeconds )
+	// x64 port: retail toggled every rendered frame -- a visible ~15-30Hz strobe
+	// at 1998 frame rates, but an invisible 100Hz flash at the 200fps cap. Toggle
+	// on the 35Hz server tick instead so the cadence matches the original.
+	static DWORD LastUpdateTicks=0; static int Toggle=0;
+	DWORD Ticks = (DWORD)(Owner->Level->TimeSeconds * 35.0);
+	if( LastUpdateTicks != Ticks )
 	{
-		LastUpdateTime = Owner->Level->TimeSeconds;
+		LastUpdateTicks = Ticks;
 		Toggle ^= 1;
 	}
 	if( Toggle ) Brightness = 0.0;

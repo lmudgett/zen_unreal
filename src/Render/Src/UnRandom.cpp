@@ -85,8 +85,16 @@ void FGlobalRandoms::Tick( FLOAT TimeSeconds )
 	// *(int*)&result = (*(int*)&temp & 0xff800000) | (randombits & 0x007fffff);
 
 	// Regenerate all random bases for temporally discontinuous random numbers.
-	for( int i=0; i<N_RANDS; i++ )
-		RandomBases[i] = appFrand();
+	// x64 port: retail regenerated these every rendered frame, which read as
+	// ~30-60Hz flicker in 1998 but fuses into a steady dim glow at the modern
+	// 200fps cap (LT_Flicker and the LE_ shimmer merges sample RandomBases).
+	// Regenerate only when the 35Hz server tick advances -- the cadence this
+	// file's header comment ("updated per tick") and the continuous Randoms
+	// below already assume. First frame (LastTicks==0) always seeds.
+	int i;
+	if( ServerTicks!=LastTicks || !LastTicks )
+		for( i=0; i<N_RANDS; i++ )
+			RandomBases[i] = appFrand();
 	
 	// Update range of random numbers.
 	if( ((DWORD)((ServerTicks - LastTicks) * RAND_CYCLE) < N_RANDS) && LastTicks )
