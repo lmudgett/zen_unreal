@@ -4,13 +4,14 @@ REM  build-dist.bat - Build the SDL (ZenUnreal) game and (re)create dist\.
 REM
 REM  Creates a dist\ folder and writes a self-contained runnable tree into it;
 REM  if dist\ already exists its contents are overwritten. Contents:
-REM    dist\System   = release DLLs + SDL3.dll + ZenUnreal.exe + *.u/*.int/*.ini
+REM    dist\System   = release DLLs + SDL3.dll + MSVC runtime + ZenUnreal.exe
+REM                    + *.u/*.int/*.ini
 REM    dist\content  = Maps/Music/Sounds/Textures (mirrored from content\)
 REM  Then runs the 32-check selftest.
 REM
 REM  Run:  build-dist.bat   (double-click, or from a terminal in the repo root)
 REM  Needs Visual Studio 2022 and a configured build-sdl\ CMake tree
-REM  (cmake -S . -B build-sdl -DUNREAL_USE_SDL=ON). Does NOT reconfigure CMake;
+REM  (cmake -S . -B build-sdl). Does NOT reconfigure CMake;
 REM  if you edited CMakeLists.txt, run that cmake command once first.
 REM
 REM  Author: Len Mudgett
@@ -34,7 +35,7 @@ ping -n 3 127.0.0.1 >nul
 REM --- Build every module ---------------------------------------------------
 echo.
 echo === Building modules (Release x64) ===
-for %%M in (Core Engine Fire Render IpDrv Galaxy OpenGLDrv SDLDrv Editor Window WinDrv) do (
+for %%M in (Core Engine Fire Render IpDrv Galaxy OpenGLDrv SDLDrv Editor Window) do (
   echo   %%M
   "%MSBUILD%" "build-sdl\%%M.vcxproj" -p:Configuration=Release -p:Platform=x64 -m -nologo -clp:ErrorsOnly
   if errorlevel 1 ( echo. & echo BUILD FAILED: %%M & exit /b 1 )
@@ -80,11 +81,16 @@ REM Savegames write to SavePath=..\Save (relative to System); keep existing save
 if not exist "dist\Save" mkdir "dist\Save"
 
 set "COPYERR="
-for %%D in (Core Engine Fire Render IpDrv Galaxy OpenGLDrv SDLDrv Editor Window WinDrv) do (
+for %%D in (Core Engine Fire Render IpDrv Galaxy OpenGLDrv SDLDrv Editor Window) do (
   copy /y "System\%%D.dll" "dist\System\" >nul || set "COPYERR=1"
 )
 copy /y "System\SDL3.dll"     "dist\System\" >nul || set "COPYERR=1"
 copy /y "System\ZenUnreal.exe" "dist\System\" >nul || set "COPYERR=1"
+REM App-local MSVC runtime: ships beside the exe so a clean Windows install
+REM runs without the VC++ redistributable (UCRT is in-box on Windows 10+).
+for %%R in (msvcp140.dll msvcp140_1.dll msvcp140_2.dll vcruntime140.dll vcruntime140_1.dll concrt140.dll) do (
+  copy /y "System\%%R" "dist\System\" >nul || set "COPYERR=1"
+)
 copy /y "System\*.u"          "dist\System\" >nul
 copy /y "System\*.int"        "dist\System\" >nul
 copy /y "System\ZenUnreal.ini" "dist\System\" >nul
