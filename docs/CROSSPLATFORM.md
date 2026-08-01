@@ -63,8 +63,9 @@ means a full rewrite for no portability gain.
   keyboard/mouse input (SDL events → `Engine->InputEvent`). OpenGLDrv gained
   a `UNREAL_USE_SDL` path that creates/binds/swaps the GL context via
   `SDL_GL_*` instead of wgl. SDL is vendored through CMake `FetchContent`
-  (`release-3.4.12`); `-DUNREAL_USE_SDL=ON` builds it (default OFF on
-  Windows so the WinDrv build is untouched; forced ON on Linux/macOS).
+  (`release-3.4.12`). (Originally opt-in via `-DUNREAL_USE_SDL=ON` beside a
+  default WinDrv build; since 2026-08-01 SDL is the only windowing backend —
+  WinDrv and its DirectX dependency are retired to `legacy/`.)
   **Verified on Windows**: the game boots through `SDLClient`, opens an SDL
   window, creates an OpenGL 4.6 context via SDL, and renders the live
   DmAriza level with HUD + crosshair (screenshot-confirmed). Because SDL

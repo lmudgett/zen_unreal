@@ -18,16 +18,9 @@ else()
     message(STATUS "Unreal: ${CMAKE_SYSTEM_NAME} platform (cross-platform migration — see docs/CROSSPLATFORM.md)")
 endif()
 
-# SDL windowing/input backend (Phase 2). Off by default on Windows (WinDrv
-# stays the default, so the Windows build is unchanged), forced on elsewhere
-# (SDL is the only windowing backend). Turn on with -DUNREAL_USE_SDL=ON to
-# build + test the SDL client on Windows too (SDL abstracts the OS, so a
-# working frame here proves the Linux path).
-if(UNREAL_PLATFORM_WINDOWS)
-    option(UNREAL_USE_SDL "Build the SDL windowing backend (SDLDrv)" OFF)
-else()
-    set(UNREAL_USE_SDL ON CACHE BOOL "" FORCE)
-endif()
+# SDL is the only windowing/input backend on every platform. The DirectX-based
+# WinDrv client is retired to legacy/ (DirectX is fully removed from the port
+# for cross-platform compatibility).
 
 # All runtime binaries land in System/ next to Unreal.ini, as the engine expects.
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/System)
@@ -97,12 +90,11 @@ add_unreal_package(Render Engine)
 add_unreal_package(IpDrv  Engine ${UNREAL_NET_LIBS})
 
 # --- Windows-only backends (being migrated to SDL / portable audio) --------
-# Window (Win32 widget library), WinDrv (DirectDraw+input), and the Editor
-# shell are the Win32 surface targeted for SDL/ImGui replacement. Gated so a
-# non-Windows configure omits them until their portable equivalents land.
+# Window (Win32 widget library) and the Editor shell are the remaining Win32
+# surface targeted for SDL/ImGui replacement. Gated so a non-Windows configure
+# omits them until their portable equivalents land.
 if(UNREAL_PLATFORM_WINDOWS)
     add_unreal_package(Window Engine comctl32 winmm) # x64 port: winmm for timeBeginPeriod (frame cap)
-    add_unreal_package(WinDrv Engine Window winmm dxguid ddraw)
     add_unreal_package(Editor Engine Window user32 oleaut32 comctl32) # ucc/-make script compiler
 endif()
 
@@ -134,81 +126,63 @@ else()
     target_compile_options(xmplite PRIVATE -w)
 endif()
 
-# --- SDL windowing backend (Phase 2) ---------------------------------------
-if(UNREAL_USE_SDL)
-    include(FetchContent)
-    set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
-    set(SDL_SHARED ON CACHE BOOL "" FORCE)
-    set(SDL_STATIC OFF CACHE BOOL "" FORCE)
-    FetchContent_Declare(SDL3
-        GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
-        GIT_TAG release-3.4.12
-        GIT_SHALLOW TRUE)
-    FetchContent_MakeAvailable(SDL3)
+# --- SDL windowing backend -------------------------------------------------
+include(FetchContent)
+set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
+set(SDL_SHARED ON CACHE BOOL "" FORCE)
+set(SDL_STATIC OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(SDL3
+    GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
+    GIT_TAG release-3.4.12
+    GIT_SHALLOW TRUE)
+FetchContent_MakeAvailable(SDL3)
 
-    add_unreal_package(SDLDrv Engine SDL3::SDL3)
-    add_unreal_package(OpenGLDrv Engine ${OPENGL_LIB} SDL3::SDL3)
-    target_compile_definitions(OpenGLDrv PRIVATE UNREAL_USE_SDL=1)
-    # Portable audio (Phase 3): the SDL build uses SDL3 audio ONLY on non-Windows;
-    # on WINDOWS it uses the verified XAudio2 engine even in the SDL build (the
-    # from-scratch SDL mixer had subtle quality issues) -- see UNREAL_SDL_AUDIO in
-    # Galaxy.cpp. Link the backend that matches the platform.
-    if(UNREAL_PLATFORM_WINDOWS)
-        add_unreal_package(Galaxy Engine winmm ole32 xaudio2 xmplite) # XAudio2 on Windows even in the SDL build
-    else()
-        add_unreal_package(Galaxy Engine SDL3::SDL3 xmplite)          # SDL3 audio on Linux/macOS
-    endif()
-    target_compile_definitions(Galaxy PRIVATE UNREAL_USE_SDL=1)
-    # Stage SDL3's shared library next to the game binaries.
-    add_custom_command(TARGET SDLDrv POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            $<TARGET_FILE:SDL3::SDL3> ${CMAKE_SOURCE_DIR}/System)
-endif()
+add_unreal_package(SDLDrv Engine SDL3::SDL3)
+add_unreal_package(OpenGLDrv Engine ${OPENGL_LIB} SDL3::SDL3)
+target_compile_definitions(OpenGLDrv PRIVATE UNREAL_USE_SDL=1)
+# Portable audio (Phase 3): SDL3 audio on every platform (XAudio2 retired with
+# the Windows-only stack 2026-08-01) -- see UNREAL_SDL_AUDIO in Galaxy.cpp.
+add_unreal_package(Galaxy Engine SDL3::SDL3 xmplite)
+target_compile_definitions(Galaxy PRIVATE UNREAL_USE_SDL=1)
+# Stage SDL3's shared library next to the game binaries.
+add_custom_command(TARGET SDLDrv POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        $<TARGET_FILE:SDL3::SDL3> ${CMAKE_SOURCE_DIR}/System)
 
 # --- Dear ImGui (Phase 5: cross-platform editor UI) -------------------------
 # Vendored like SDL via FetchContent (docking branch release: dockable panel
 # layout for the editor frame). ImGui ships no CMakeLists — we define a small
-# static lib with the SDL3 + OpenGL3 backends. Only built for the SDL config
-# (the editor UI targets the portable stack).
-if(UNREAL_USE_SDL)
-    FetchContent_Declare(imgui
-        GIT_REPOSITORY https://github.com/ocornut/imgui.git
-        GIT_TAG v1.91.5-docking
-        GIT_SHALLOW TRUE)
-    FetchContent_MakeAvailable(imgui)
-    add_library(imgui STATIC
-        ${imgui_SOURCE_DIR}/imgui.cpp
-        ${imgui_SOURCE_DIR}/imgui_draw.cpp
-        ${imgui_SOURCE_DIR}/imgui_tables.cpp
-        ${imgui_SOURCE_DIR}/imgui_widgets.cpp
-        ${imgui_SOURCE_DIR}/imgui_demo.cpp
-        ${imgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp
-        ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp)
-    target_include_directories(imgui PUBLIC
-        ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends)
-    target_link_libraries(imgui PUBLIC SDL3::SDL3)
-    if(MSVC)
-        target_compile_options(imgui PRIVATE /w)
-    else()
-        target_compile_options(imgui PRIVATE -w)
-    endif()
-
-    # The ImGui editor frame (portable UnrealEd shell). Static lib linked
-    # into the SDL launcher; hooks into SDLDrv (events) and OpenGLDrv
-    # (post-render overlay), drives the editor engine via Exec strings.
-    add_library(EdGui STATIC ${CMAKE_SOURCE_DIR}/src/EdGui/Src/EdGui.cpp)
-    target_include_directories(EdGui PUBLIC ${CMAKE_SOURCE_DIR}/src/EdGui/Inc)
-    target_link_libraries(EdGui PUBLIC Core Engine SDLDrv OpenGLDrv imgui)
+# static lib with the SDL3 + OpenGL3 backends.
+FetchContent_Declare(imgui
+    GIT_REPOSITORY https://github.com/ocornut/imgui.git
+    GIT_TAG v1.91.5-docking
+    GIT_SHALLOW TRUE)
+FetchContent_MakeAvailable(imgui)
+add_library(imgui STATIC
+    ${imgui_SOURCE_DIR}/imgui.cpp
+    ${imgui_SOURCE_DIR}/imgui_draw.cpp
+    ${imgui_SOURCE_DIR}/imgui_tables.cpp
+    ${imgui_SOURCE_DIR}/imgui_widgets.cpp
+    ${imgui_SOURCE_DIR}/imgui_demo.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp)
+target_include_directories(imgui PUBLIC
+    ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends)
+target_link_libraries(imgui PUBLIC SDL3::SDL3)
+if(MSVC)
+    target_compile_options(imgui PRIVATE /w)
+else()
+    target_compile_options(imgui PRIVATE -w)
 endif()
 
-# --- Windows XAudio2 audio + wgl GL (default Windows build) -----------------
-if(UNREAL_PLATFORM_WINDOWS AND NOT UNREAL_USE_SDL)
-    add_unreal_package(Galaxy Engine winmm ole32 xaudio2 xmplite) # XAudio2
-    add_unreal_package(OpenGLDrv Engine opengl32)                 # wgl OpenGL
-endif()
+# The ImGui editor frame (portable UnrealEd shell). Static lib linked
+# into the SDL launcher; hooks into SDLDrv (events) and OpenGLDrv
+# (post-render overlay), drives the editor engine via Exec strings.
+add_library(EdGui STATIC ${CMAKE_SOURCE_DIR}/src/EdGui/Src/EdGui.cpp)
+target_include_directories(EdGui PUBLIC ${CMAKE_SOURCE_DIR}/src/EdGui/Inc)
+target_link_libraries(EdGui PUBLIC Core Engine SDLDrv OpenGLDrv imgui)
 
-# The launcher builds everywhere: WinMain + Window log window on the default
-# Windows build, the portable SDL launcher when UNREAL_USE_SDL (Phase 4).
+# The portable SDL launcher (Phase 4).
 add_subdirectory(src/Launch)                # Unreal / Unreal.exe
 
 # ---------------------------------------------------------------------------
@@ -231,15 +205,11 @@ add_subdirectory(src/Launch)                # Unreal / Unreal.exe
 # it — Dug, NaliC, Ruins) need Editor.dll's intrinsic classes to load, and
 # it enables `-make` script rebuilds from a dist. (x64 port)
 set(UNREAL_RUNTIME_TARGETS
-    Core Engine Fire Render IpDrv Galaxy OpenGLDrv Unreal)
+    Core Engine Fire Render IpDrv Galaxy OpenGLDrv SDLDrv Unreal)
+# SDL3's own shared library is staged into System/ by the post-build copy
+# above (dist packaging of SDL3 itself: TODO with Linux packaging).
 if(UNREAL_PLATFORM_WINDOWS)
-    list(APPEND UNREAL_RUNTIME_TARGETS Window WinDrv Editor)
-endif()
-if(UNREAL_USE_SDL)
-    # SDLDrv ships; SDL3's own shared library is staged into System/ by the
-    # post-build copy above (dist packaging of SDL3 itself: TODO with Phase 4+
-    # Linux packaging).
-    list(APPEND UNREAL_RUNTIME_TARGETS SDLDrv)
+    list(APPEND UNREAL_RUNTIME_TARGETS Window Editor)
 endif()
 
 # Release binaries only: RUNTIME installs the .exe and .dll; ARCHIVE (import
@@ -247,6 +217,15 @@ endif()
 install(TARGETS ${UNREAL_RUNTIME_TARGETS}
     RUNTIME DESTINATION System
     LIBRARY DESTINATION System)
+
+# App-local MSVC runtime (msvcp140/vcruntime140*): shipped beside the exe so a
+# clean Windows install runs the game without the VC++ redistributable. The
+# UCRT (api-ms-win-crt-*) is in-box on Windows 10+ and intentionally not
+# shipped. SDL3.dll is staged by the SDLDrv post-build copy.
+if(MSVC)
+    set(CMAKE_INSTALL_SYSTEM_RUNTIME_DESTINATION System)
+    include(InstallRequiredSystemLibraries)
+endif()
 
 # Runtime data that lives in the source System/ (retail script packages,
 # localization, config). Match only these extensions so the co-located build

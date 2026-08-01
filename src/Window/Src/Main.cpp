@@ -292,7 +292,7 @@ UEngine* InitEngine()
 			appSprintf( Temp, Localize("FirstRun","LowMemory"), GPhysicalMemory/1024/1024 );
 			::MessageBox( NULL, Temp, Localize("FirstRun","Caption"), MB_OK|MB_ICONINFORMATION|MB_TASKMODAL );
 			SetConfigBool( "Galaxy.GalaxyAudioSubsystem", "LowSoundQuality", 1 );
-			SetConfigBool( "WinDrv.WindowsClient", "LowDetailTextures", 1 );
+			SetConfigBool( "SDLDrv.SDLClient", "LowDetailTextures", 1 );
 		}
 
 		// MMX detection.
@@ -305,8 +305,8 @@ UEngine* InitEngine()
 		// Low res detection.
 		if( !GIsMMX || !GIsPentiumPro )
 		{
-			SetConfigString( "WinDrv.WindowsClient", "ViewportX", "320" );
-			SetConfigString( "WinDrv.WindowsClient", "ViewportY", "240" );
+			SetConfigString( "SDLDrv.SDLClient", "ViewportX", "320" );
+			SetConfigString( "SDLDrv.SDLClient", "ViewportY", "240" );
 		}
 
 		// Autodetect and ask about detected render devices.

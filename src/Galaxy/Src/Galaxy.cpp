@@ -26,12 +26,12 @@
 #include <windows.h>
 #include <mmsystem.h>
 #endif
-// cross-platform port: AUDIO BACKEND SELECTION. The SDL build uses SDL for
-// windowing/input/GL, but on WINDOWS it uses the verified XAudio2 engine anyway
-// -- the from-scratch SDL audio mixer is compiled ONLY where XAudio2 doesn't
-// exist (Linux/macOS). Everything above the backend (spatialization, priority,
-// ambient scan, music state machine) is backend-agnostic and shared.
-#if UNREAL_USE_SDL && !defined(_WIN32)
+// cross-platform port: AUDIO BACKEND SELECTION. SDL3 audio is the backend on
+// every platform (2026-08-01; XAudio2 retired with the rest of the
+// Windows-only stack). The XAudio2 branches below are kept compilable for
+// reference but are not built. Everything above the backend (spatialization,
+// priority, ambient scan, music state machine) is backend-agnostic and shared.
+#if UNREAL_USE_SDL
 	#define UNREAL_SDL_AUDIO 1
 #else
 	#define UNREAL_SDL_AUDIO 0

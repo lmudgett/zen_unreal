@@ -52,19 +52,15 @@ Eight milestones done, each verified interactively:
 | `docs/` | `PORTING.md` (x64 port history), `CROSSPLATFORM.md` (migration log) |
 | `dist/` | Self-contained distributable produced by `build-dist.bat` (untracked) |
 
-Engine modules under `src/`: `Core`, `Engine`, `Render`, `Fire`, `Galaxy` (audio), `IpDrv` (networking), `OpenGLDrv`, `WinDrv` / `SDLDrv` (windowing), `Window`, `Editor`, `EdGui` (ImGui editor UI), `UnrealI` (game script sources), `Launch`, `ThirdParty` (libxmp-lite).
+Engine modules under `src/`: `Core`, `Engine`, `Render`, `Fire`, `Galaxy` (audio), `IpDrv` (networking), `OpenGLDrv`, `SDLDrv` (windowing), `Window`, `Editor`, `EdGui` (ImGui editor UI), `UnrealI` (game script sources), `Launch`, `ThirdParty` (libxmp-lite). The DirectX-based `WinDrv` client is retired to `legacy/` — SDL is the only windowing backend, and DirectX is fully removed from the port.
 
 ## Building
 
 Requirements: CMake ≥ 3.21, 64-bit toolchain. Windows: Visual Studio 2022 (MSVC v143) + Windows SDK 10. SDL3 and Dear ImGui are fetched automatically by CMake.
 
 ```powershell
-# Classic Windows build (WinDrv — original windowing path)
-cmake -B build
-cmake --build build --config Release
-
-# SDL3 build (cross-platform path; required for the ImGui editor)
-cmake -S . -B build-sdl -DUNREAL_USE_SDL=ON
+# SDL3 build (the only build flavor — SDL is the sole windowing backend)
+cmake -S . -B build-sdl
 cmake --build build-sdl --config Release
 
 # One-shot: build SDL modules, link ZenUnreal.exe, validate, stage dist\, selftest
@@ -72,7 +68,7 @@ build-dist.bat
 ```
 
 Notes:
-- Binaries land in `System/` next to the ini files, as the engine expects. **Both build trees write into the same `System/`** — rebuild the tree you intend to run. Watch for an IDE CMake watcher rebuilding the default tree and clobbering SDL-variant DLLs (check `OpenGLDrv.dll`/`Galaxy.dll` import `SDL3.dll` if in doubt).
+- Binaries land in `System/` next to the ini files, as the engine expects.
 - The launcher links under the name `ZenUnreal` via `-p:TargetName=ZenUnreal -p:BuildProjectReferences=false` (see `build-dist.bat`); the exe base name selects `<name>.ini` / `<name>.log`, so the config file is `System\ZenUnreal.ini`.
 - `build-dist.bat` validates the source tree (non-truncated ini, all 6 `.u` packages) **before** overwriting an existing `dist\`, and finishes by running the selftest from inside the dist.
 
