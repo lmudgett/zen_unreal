@@ -1,0 +1,14 @@
+Begin Map
+Begin Actor Class=PlayerStart Name=PlayerStart0
+    Location=(X=-300.000000,Y=0.000000,Z=-83.000000)
+End Actor
+Begin Actor Class=Light Name=FlickerLight0
+    Location=(X=100.000000,Y=0.000000,Z=0.000000)
+    LightType=LT_Flicker
+    LightBrightness=128
+    LightRadius=64
+End Actor
+Begin Actor Class=TorchFlame Name=TorchFlame0
+    Location=(X=300.000000,Y=-250.000000,Z=-60.000000)
+End Actor
+End Map

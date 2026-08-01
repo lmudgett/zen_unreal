@@ -20,6 +20,7 @@
 
 IMPLEMENT_CLASS(USDLViewport);
 IMPLEMENT_CLASS(USDLClient);
+IMPLEMENT_CLASS(UNullRenderDevice);
 IMPLEMENT_PACKAGE(SDLDrv);
 
 // Phase 5 (ImGui editor): first-chance event filter, see SDLDrvHooks.h.
@@ -200,6 +201,10 @@ void USDLViewport::OpenWindow( DWORD ParentWindow, UBOOL Temporary, INT NewX, IN
 		SizeX = NewX; SizeY = NewY;
 		ScreenPointer = (BYTE*)appMalloc( 4*NewX*NewY, "TemporaryViewportData" );
 		Window = NULL;
+		// x64 port: the editor raytracer Locks temporary viewports; retail gave
+		// them the software renderer, we give a no-op device (see UNullRenderDevice).
+		RenDev = ConstructClassObject<URenderDevice>( UNullRenderDevice::StaticClass );
+		RenDev->Init( this );
 		debugf( NAME_Log, "Opened temporary SDL viewport" );
 		return;
 	}

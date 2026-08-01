@@ -23,3 +23,6 @@ Crash.txt
 # Local git-history backups (delete after push is verified)
 /.git-backup-pre-github/
 /.git-backup-scrub/
+
+# ImGui editor window-layout state (written at editor exit)
+System/EdGui.ini

@@ -60,6 +60,39 @@ class DLL_EXPORT USDLViewport : public UViewport
 };
 
 /*-----------------------------------------------------------------------------
+	UNullRenderDevice.
+-----------------------------------------------------------------------------*/
+
+// x64 port: retail WinDrv gave every viewport a render device -- temporary
+// (offscreen) ones got the software renderer (WindowedRenderDevice). The
+// editor lighting raytracer (shadowIlluminateBsp -> GetVisibleSurfs) Locks
+// such a viewport, and UViewport::Lock check(RenDev) fires without one. The
+// raytracer's visibility work is all software (OccludeBsp); the device is
+// only a formality, so temporary SDL viewports get this no-op device.
+class DLL_EXPORT UNullRenderDevice : public URenderDevice
+{
+	DECLARE_CLASS(UNullRenderDevice,URenderDevice,CLASS_Transient)
+
+	// URenderDevice interface.
+	UBOOL Init( UViewport* InViewport ) { Viewport=InViewport; SpanBased=1; FrameBuffered=0; return 1; }
+	void Exit() {}
+	void Flush() {}
+	UBOOL Exec( const char* Cmd, FOutputDevice* Out ) { return 0; }
+	void Lock( FPlane FlashScale, FPlane FlashFog, FPlane ScreenClear, DWORD RenderLockFlags, BYTE* HitData, INT* HitSize ) {}
+	void Unlock( UBOOL Blit ) {}
+	void DrawComplexSurface( FSceneNode* Frame, FSurfaceInfo& Surface, FSurfaceFacet& Facet ) {}
+	void DrawGouraudPolygon( FSceneNode* Frame, FTextureInfo& Info, FTransTexture** Pts, int NumPts, DWORD PolyFlags, FSpanBuffer* Span ) {}
+	void DrawTile( FSceneNode* Frame, FTextureInfo& Info, FLOAT X, FLOAT Y, FLOAT XL, FLOAT YL, FLOAT U, FLOAT V, FLOAT UL, FLOAT VL, class FSpanBuffer* Span, FLOAT Z, FPlane Color, FPlane Fog, DWORD PolyFlags ) {}
+	void Draw2DLine( FSceneNode* Frame, FPlane Color, DWORD LineFlags, FVector P1, FVector P2 ) {}
+	void Draw2DPoint( FSceneNode* Frame, FPlane Color, DWORD LineFlags, FLOAT X1, FLOAT Y1, FLOAT X2, FLOAT Y2 ) {}
+	void ClearZ( FSceneNode* Frame ) {}
+	void PushHit( const BYTE* Data, INT Count ) {}
+	void PopHit( INT Count, UBOOL bForce ) {}
+	void GetStats( char* Result ) { if( Result ) *Result=0; }
+	void ReadPixels( FColor* Pixels ) {}
+};
+
+/*-----------------------------------------------------------------------------
 	USDLClient.
 -----------------------------------------------------------------------------*/
 
