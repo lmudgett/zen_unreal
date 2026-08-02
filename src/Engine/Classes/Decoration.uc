@@ -206,9 +206,18 @@ function Bump( actor Other )
 	local float speed, oldZ;
 	if( bPushable && (Pawn(Other)!=None) && (Other.Mass > 40) )
 	{
+		speed = VSize(Other.Velocity);
+		// x64 port: a pusher wedged against a wall keeps bumping while stepUp()
+		// damps its velocity by the mass ratio every frame, so speed reaches
+		// exactly 0 (far more likely at modern frame rates than at 1998's ~35
+		// fps). The unguarded 0/0 below made Velocity - and then Location - NaN,
+		// after which the actor "fell out of the world" and its destruction hit
+		// the "moved without proper hashing" check in the collision hash.
+		// A pusher that isn't moving imparts no push, so there is nothing to do.
+		if ( speed < 0.01 )
+			return;
 		bBobbing = false;
 		oldZ = Velocity.Z;
-		speed = VSize(Other.Velocity);
 		Velocity = Other.Velocity * FMin(120.0, 20 + speed)/speed;
 		if ( Physics == PHYS_None ) {
 			Velocity.Z = 25;

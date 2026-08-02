@@ -675,7 +675,18 @@ function DiscardInventory( Pawn Other )
 	{
 		speed = VSize(Other.Velocity);
 		weap = Other.Weapon;
-		weap.Velocity = Normal(Other.Velocity/speed + 0.5 * VRand()) * (speed + 280);
+		// x64 port: same unguarded 0/0 as Decoration.Bump(). A pawn killed with no
+		// momentum dies with Velocity exactly 0 (TriggeredDeath, drowning), so
+		// Other.Velocity/speed was 0/0 = NaN and the tossed weapon inherited a NaN
+		// velocity - DropFrom() only calls SetPhysics(PHYS_Falling) and never
+		// overwrites it, so Location went NaN, the weapon "fell out of the world",
+		// and destroying it tripped "moved without proper hashing".
+		// With no motion to bias the toss, throw it in a purely random direction -
+		// which is what the expression below degenerates to as speed approaches 0.
+		if ( speed > 0.01 )
+			weap.Velocity = Normal(Other.Velocity/speed + 0.5 * VRand()) * (speed + 280);
+		else
+			weap.Velocity = VRand() * 280;
 		Other.TossWeapon();
 		if ( weap.PickupAmmoCount == 0 )
 			weap.PickupAmmoCount = 1;

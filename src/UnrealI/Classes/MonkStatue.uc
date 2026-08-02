@@ -32,7 +32,15 @@ Auto State Animate
 
 	function Timer()
 	{
-		if (Velocity.z<-80) 
+		// x64 port: this state's Timer() shadows Decoration.Timer(), which is the
+		// handler Decoration.Bump() arms its 0.3s timer for - so EndPushSound
+		// never played and bPushSoundPlaying was never cleared, leaving the
+		// looping push sample grinding forever on SLOT_Misc (and, because the
+		// flag stayed set, never restarting on a later push). MonkStatue is the
+		// only pushable decoration that overrides Timer() in its auto state.
+		if ( bPushSoundPlaying )
+			Global.Timer();
+		if (Velocity.z<-80)
 		{
 			RotationRate.Yaw = 15000;
 			RotationRate.Pitch = 15000;
