@@ -296,9 +296,34 @@ means a full rewrite for no portability gain.
       before judging a black view. `-glcounts` logs per-viewport
       surf/poly/tile counts to distinguish engine-cull from GL-state
       bugs.
-  - **Next**: camera-speed / grid toolbar, property-edit undo,
-    texture-browser GROUP filter + scroll clamp, surface properties
-    panel, actor-click selection polish (verify HActor path / ortho
+  - **Milestone 9 (DONE 2026-08-02, screenshot-verified) — toolbar.**
+    An ImGui `BeginViewportSideBar` row docked under the main menu (so
+    it insets the work area and the panels lay out below it): camera
+    movement speed (Slow/Normal/Fast = the 1/4/16 of UnEdCam's 1/2/3
+    hotkeys), movement grid on/off + size, rotation grid on/off + angle,
+    snap-to-vertex, and the 2D/3D grid display toggles. Every control
+    **reads the live `UEditorEngine` members** (`MovementSpeed`,
+    `Constraints`, `Show2DGrid/3DGrid`) and writes through Exec, so the
+    bar stays truthful when the same state is changed from the console
+    or the camera-speed hotkeys — unlike `GModeIndex`, which must be
+    shadowed shell-side because no topic reports Mode back.
+    - Rotation grid: `RotGridSize` is in Unreal angle units (65536 =
+      360°) but `MAP ROTGRID PITCH=` is parsed by `GetFROTATOR` with a
+      ScaleFactor of 256, so the command takes units/256 (22.5° = 4096
+      units, sent as 16).
+    - Trap: `MAP GRID` runs `GetFVECTOR` on its whole argument string
+      unconditionally, and with no `X=/Y=/Z=` present that falls through
+      to the comma format and leaves `GridSize.X` clobbered to
+      `appAtof("SHOW2D=ON")` == 0. The display toggles therefore resend
+      the current grid size alongside the flag.
+    - Verified by driving every command the toolbar emits from
+      `EdGuiBoot.txt` and screenshotting the result: the bar reads back
+      Fast / Grid 64 / Rot 45 / Snap Vtx / 2D / 3D, with the grid still
+      64 after the SHOW2D/SHOW3D commands ran last (0 would mean the
+      GetFVECTOR clobber was live).
+  - **Next**: property-edit undo,
+    texture-browser GROUP filter + scroll clamp,
+    actor-click selection polish (verify HActor path / ortho
     wire picking interactively), persp wireframe-line check (REN=1 in
     perspective untested).
 

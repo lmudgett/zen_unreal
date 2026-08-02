@@ -51,6 +51,7 @@ static SDL_Window* GImGuiWindow	= NULL;	// the primary (3D) window ImGui lives o
 static FOutputDevice* GPrevLogHook = NULL;
 
 // Panel visibility.
+static bool		GShowToolbar	= true;
 static bool		GShowLog		= true;
 static bool		GShowConsole	= true;
 static bool		GShowProps		= true;
@@ -870,6 +871,144 @@ static void BuildContextMenu()
 	UI.
 -----------------------------------------------------------------------------*/
 
+/*-----------------------------------------------------------------------------
+	Toolbar.
+
+	The 1998 shell's camera-speed / grid / snap toolbar. Every control READS
+	the live UEditorEngine members and WRITES through Exec, so the bar stays
+	truthful when the same settings are changed elsewhere -- the console, or
+	UnEdCam's 1/2/3 camera-speed hotkeys. That is the opposite of GModeIndex,
+	which has to be shadowed shell-side because the engine exposes no topic
+	reporting Mode back.
+-----------------------------------------------------------------------------*/
+
+// Camera speeds, matching the '1'/'2'/'3' hotkeys in UnEdCam.cpp.
+static const FLOAT	GCamSpeeds[]		= { 1.f, 4.f, 16.f };
+static const char*	GCamSpeedNames[]	= { "Slow", "Normal", "Fast" };
+
+static const INT	GGridSizes[]		= { 1, 2, 4, 8, 16, 32, 64, 128, 256 };
+
+// Rotation grid. RotGridSize is in Unreal angle units (65536 == 360 degrees),
+// but "MAP ROTGRID PITCH=" is parsed with GetFROTATOR's ScaleFactor of 256, so
+// the command takes units/256 -- 22.5 degrees is 4096 units, sent as 16.
+static const INT	GRotSizes[]			= { 1024, 2048, 4096, 8192, 16384 };
+static const char*	GRotNames[]			= { "5.625", "11.25", "22.5", "45", "90" };
+
+static void BuildToolbar()
+{
+	UEditorEngine* Ed = (UEditorEngine*)GEdEngine;
+	char Cmd[128];
+
+	// Mirrors BeginMainMenuBar: a viewport side bar insets the work area, so
+	// this docks directly under the menu bar and panels lay out below it.
+	ImGuiWindowFlags Flags = ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_MenuBar;
+	if( ImGui::BeginViewportSideBar( "##EdToolbar", ImGui::GetMainViewport(), ImGuiDir_Up, ImGui::GetFrameHeight(), Flags ) )
+	{
+		// A menu bar lays items out horizontally, so no SameLine calls here,
+		// and Separator draws vertically.
+		if( ImGui::BeginMenuBar() )
+		{
+			// --- Camera movement speed ------------------------------------
+			ImGui::TextUnformatted( "Speed" );
+			for( INT i=0; i<(INT)ARRAY_COUNT(GCamSpeeds); i++ )
+				if( ImGui::RadioButton( GCamSpeedNames[i], Ed->MovementSpeed==GCamSpeeds[i] ) )
+				{
+					appSprintf( Cmd, "MODE SPEED=%f", GCamSpeeds[i] );
+					EdExec( Cmd );
+				}
+
+			ImGui::Separator();
+
+			// --- Movement grid --------------------------------------------
+			bool GridOn = Ed->Constraints.GridEnabled ? true : false;
+			if( ImGui::Checkbox( "Grid", &GridOn ) )
+			{
+				appSprintf( Cmd, "MODE GRID=%i", GridOn ? 1 : 0 );
+				EdExec( Cmd );
+			}
+			INT CurGrid = (INT)Ed->Constraints.GridSize.X;
+			char GridLabel[16];
+			appSprintf( GridLabel, "%i", CurGrid );
+			ImGui::SetNextItemWidth( 72 );
+			if( ImGui::BeginCombo( "##gridsize", GridLabel ) )
+			{
+				for( INT i=0; i<(INT)ARRAY_COUNT(GGridSizes); i++ )
+				{
+					char Item[16];
+					appSprintf( Item, "%i", GGridSizes[i] );
+					if( ImGui::Selectable( Item, CurGrid==GGridSizes[i] ) )
+					{
+						// Uniform on all three axes, as the 1998 drag grid was.
+						appSprintf( Cmd, "MAP GRID X=%i Y=%i Z=%i", GGridSizes[i], GGridSizes[i], GGridSizes[i] );
+						EdExec( Cmd );
+					}
+				}
+				ImGui::EndCombo();
+			}
+
+			ImGui::Separator();
+
+			// --- Rotation grid --------------------------------------------
+			bool RotOn = Ed->Constraints.RotGridEnabled ? true : false;
+			if( ImGui::Checkbox( "Rot", &RotOn ) )
+			{
+				appSprintf( Cmd, "MODE ROTGRID=%i", RotOn ? 1 : 0 );
+				EdExec( Cmd );
+			}
+			INT CurRot = Ed->Constraints.RotGridSize.Yaw;
+			const char* RotLabel = "custom";
+			for( INT i=0; i<(INT)ARRAY_COUNT(GRotSizes); i++ )
+				if( CurRot==GRotSizes[i] )
+					RotLabel = GRotNames[i];
+			ImGui::SetNextItemWidth( 80 );
+			if( ImGui::BeginCombo( "##rotsize", RotLabel ) )
+			{
+				for( INT i=0; i<(INT)ARRAY_COUNT(GRotSizes); i++ )
+					if( ImGui::Selectable( GRotNames[i], CurRot==GRotSizes[i] ) )
+					{
+						INT N = GRotSizes[i] / 256;
+						appSprintf( Cmd, "MAP ROTGRID PITCH=%i YAW=%i ROLL=%i", N, N, N );
+						EdExec( Cmd );
+					}
+				ImGui::EndCombo();
+			}
+
+			ImGui::Separator();
+
+			// --- Snapping and grid display --------------------------------
+			bool SnapVert = Ed->Constraints.SnapVertices ? true : false;
+			if( ImGui::Checkbox( "Snap Vtx", &SnapVert ) )
+			{
+				appSprintf( Cmd, "MODE SNAPVERTEX=%i", SnapVert ? 1 : 0 );
+				EdExec( Cmd );
+			}
+			// MAP GRID always runs GetFVECTOR on its argument string, and with no
+			// X=/Y=/Z= present that falls through to the comma format and leaves
+			// GridSize.X clobbered to appAtof("SHOW2D=ON") == 0. So the display
+			// toggles have to resend the current grid size alongside the flag.
+			const INT GX = (INT)Ed->Constraints.GridSize.X;
+			const INT GY = (INT)Ed->Constraints.GridSize.Y;
+			const INT GZ = (INT)Ed->Constraints.GridSize.Z;
+			bool Show2D = Ed->Show2DGrid ? true : false;
+			if( ImGui::Checkbox( "2D Grid", &Show2D ) )
+			{
+				appSprintf( Cmd, "MAP GRID SHOW2D=%s X=%i Y=%i Z=%i", Show2D ? "ON" : "OFF", GX, GY, GZ );
+				EdExec( Cmd );
+			}
+			bool Show3D = Ed->Show3DGrid ? true : false;
+			if( ImGui::Checkbox( "3D Grid", &Show3D ) )
+			{
+				appSprintf( Cmd, "MAP GRID SHOW3D=%s X=%i Y=%i Z=%i", Show3D ? "ON" : "OFF", GX, GY, GZ );
+				EdExec( Cmd );
+			}
+
+			ImGui::EndMenuBar();
+		}
+	}
+	// Begin/End must always pair, open or not.
+	ImGui::End();
+}
+
 static void BuildUI( UViewport* Viewport )
 {
 	if( GSelDirty )
@@ -983,6 +1122,7 @@ static void BuildUI( UViewport* Viewport )
 		}
 		if( ImGui::BeginMenu("View") )
 		{
+			ImGui::MenuItem( "Toolbar",    NULL, &GShowToolbar );
 			ImGui::MenuItem( "Log",        NULL, &GShowLog );
 			ImGui::MenuItem( "Console",    NULL, &GShowConsole );
 			ImGui::MenuItem( "Properties", NULL, &GShowProps );
@@ -1000,6 +1140,9 @@ static void BuildUI( UViewport* Viewport )
 		ImGui::TextDisabled( "%s", Status );
 		ImGui::EndMainMenuBar();
 	}
+
+	if( GShowToolbar )
+		BuildToolbar();
 
 	// Map load/save dialog: content\Maps listing + editable path.
 	if( GMapDialog )
