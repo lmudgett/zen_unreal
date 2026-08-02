@@ -36,7 +36,9 @@ function bool ProcessSelection()
 
 	if ( Level.NetMode != NM_Standalone )
 		SlotNames[Slot] = "Net:"$SlotNames[Slot];
-	SaveTimes[Slot] = (((Level.Year * 12 + Level.Month) * 31 + Level.Day) * 24 + Level.Hour) * 60 + Level.Minute;
+	// Seconds resolution so back-to-back saves in the same minute still order;
+	// year is based at 2020 to keep the stamp inside a signed int until 2085.
+	SaveTimes[Slot] = ((((Max(Level.Year - 2020, 0) * 12 + Level.Month) * 31 + Level.Day) * 24 + Level.Hour) * 60 + Level.Minute) * 60 + Level.Second;
 	SaveConfig();
 	bExitAllMenus = true;
 	PlayerOwner.ClientMessage(" ");
