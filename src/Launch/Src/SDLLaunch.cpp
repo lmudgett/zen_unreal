@@ -464,14 +464,72 @@ static void MainLoop( UEngine* Engine )
 		}
 	}
 
+	// -probewalk=x:y:z:yaw teleports the player there (FarMoveActor keeps the
+	// collision hash coherent) and then WALKS it in the yaw direction with
+	// collision fully live -- Velocity/Acceleration are re-primed before every
+	// tick, so movement runs through the real player path (PlayerMove ->
+	// physWalking -> MultiLineCheck). Position is logged as it goes; where it
+	// stops is where the game actually blocks. Screenshot + exit at the end.
+	FVector	WalkStart(0,0,0);
+	INT		WalkYaw = 0;
+	UBOOL	ProbeWalk = 0, WalkPlaced = 0;
+	{
+		char Spec[256]="";
+		if( Parse( appCmdLine(), "PROBEWALK=", Spec, ARRAY_COUNT(Spec) ) )
+		{
+			FLOAT X,Y,Z;
+			if( sscanf( Spec, "%f:%f:%f:%i", &X,&Y,&Z, &WalkYaw )==4 )
+			{
+				WalkStart = FVector(X,Y,Z);
+				ProbeWalk = 1;
+				Parse( appCmdLine(), "PROBEFRAMES=", ProbeFrames );
+				debugf( NAME_Log, "PROBEWALK: start (%.0f,%.0f,%.0f) yaw=%i for %i frames",
+					X,Y,Z, WalkYaw, ProbeFrames );
+			}
+			else debugf( NAME_Log, "PROBEWALK: need -probewalk=x:y:z:yaw (got '%s')", Spec );
+		}
+	}
+
 	DOUBLE StatWindowStart = OldTime;
 	INT    StatFrames = 0, StatSpikes = 0;
 	DOUBLE StatMax = 0.0, StatSum = 0.0, TickSum = 0.0, PrevTick = 0.0;
 	while( GIsRunning && !GIsRequestingExit )
 	{
+		if( ProbeWalk && Engine->Client )
+		{
+			UGameEngine* G = Cast<UGameEngine>( Engine );
+			for( INT v=0; G && G->GLevel && v<Engine->Client->Viewports.Num(); v++ )
+			{
+				APlayerPawn* P = Engine->Client->Viewports(v)->Actor;
+				if( !P )
+					continue;
+				if( !WalkPlaced )
+				{
+					WalkPlaced = 1;
+					G->GLevel->FarMoveActor( P, WalkStart, 0, 1 );
+					debugf( NAME_Log, "PROBEWALK: placed at (%.0f,%.0f,%.0f)", P->Location.X, P->Location.Y, P->Location.Z );
+				}
+				FLOAT A = WalkYaw * (2.f*PI/65536.f);
+				FVector Dir( appCos(A), appSin(A), 0.f );
+				P->Physics      = PHYS_Walking;
+				P->Rotation.Yaw = P->ViewRotation.Yaw = WalkYaw;
+				P->Velocity     = Dir * P->GroundSpeed + FVector(0,0,P->Velocity.Z);
+				P->Acceleration = Dir * P->AccelRate;
+				if( ( FrameNum % 25 )==0 || FrameNum==ProbeFrames-1 )
+					debugf( NAME_Log, "PROBEWALK: frame %3i at (%.0f,%.0f,%.0f)", FrameNum, P->Location.X, P->Location.Y, P->Location.Z );
+			}
+			if( ++FrameNum >= ProbeFrames )
+			{
+				for( INT v=0; v<Engine->Client->Viewports.Num(); v++ )
+					Engine->Client->Viewports(v)->Exec( "SHOT", GSystem );
+				debugf( NAME_Log, "PROBEWALK: done, exiting" );
+				GIsRequestingExit = 1;
+			}
+		}
+
 		char ProbeExec[128]="";
 		UBOOL HasExec = Parse( appCmdLine(), "PROBEEXEC=", ProbeExec, ARRAY_COUNT(ProbeExec) );
-		if( (PinView || HasExec) && Engine->Client )
+		if( !ProbeWalk && (PinView || HasExec) && Engine->Client )
 		{
 			// Freeze the view actor there: physics off and no world collision,
 			// otherwise gravity//pushout move it before the shot. Skipped when

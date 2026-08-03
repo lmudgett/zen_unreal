@@ -538,3 +538,10 @@ effect): `whereami` console command (position/zone/overlaps),
 maps, `-probeview=x:y:z:pitch:yaw` pinned-camera screenshots,
 `-probetrigger`/`-probeexec`, `-semisolid` all-map audit, and
 `EDGUI.MOVERINFO`/`EDGUI.MOVERPROBE` mover collision dumps.
+
+In-game verification (`-probewalk=x:y:z:yaw`, added after the fix landed):
+drives the player pawn through the live movement path (PlayerMove →
+physWalking → MultiLineCheck) with collision fully live. On the pre-fix map
+the pawn walks through the rock face and ends 98 units inside it (Y=280 →
+Y=-2); on the fixed map the same walk stops at the face (Y≈86-91), slides
+along it naturally, and holds — screenshot-confirmed from the pawn's view.
