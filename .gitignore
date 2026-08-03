@@ -11,6 +11,8 @@
 *.log
 Crash.txt
 *.probe
+*.png
+*.dll
 
 # Retail CD image — exceeds GitHub's 100 MB file limit; stays local-only
 /Unreal - v200/CD/
