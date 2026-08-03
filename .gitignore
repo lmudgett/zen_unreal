@@ -13,6 +13,7 @@ Crash.txt
 *.probe
 *.png
 *.dll
+*.exe
 
 # Retail CD image — exceeds GitHub's 100 MB file limit; stays local-only
 /Unreal - v200/CD/
@@ -28,4 +29,3 @@ Crash.txt
 
 # ImGui editor window-layout state (written at editor exit)
 System/EdGui.ini
-System/Unreal.exe
