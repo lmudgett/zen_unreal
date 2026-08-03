@@ -270,6 +270,115 @@ static UBOOL EdGuiCommand( const char* Cmd )
 		BuildBrushCylinder( R, H, N );
 		return 1;
 	}
+	else if( ParseCommand( &Str, "MOVERINFO" ) )
+	{
+		// Report the collision database of every mover brush in the loaded
+		// level. A mover renders from Polys but blocks from Nodes/LeafHulls
+		// (UModel::PointCheck -> FBoxCheckInfo::SetupHulls), so a mover whose
+		// saved model has nodes but no leaf hulls -- or a stale/empty
+		// BoundingBox, which is what FCollisionHash hashes it by -- is visible
+		// and walk-through. NAME= limits the report to one mover.
+		char Only[NAME_SIZE]="";
+		Parse( Str, "NAME=", Only, ARRAY_COUNT(Only) );
+		UEditorEngine* Ed = (UEditorEngine*)GEdEngine;
+		if( !Ed || !Ed->Level )
+		{
+			GEdLog.Logf( "MOVERINFO: no level loaded" );
+			return 1;
+		}
+		INT Count=0;
+		for( INT i=0; i<Ed->Level->Num(); i++ )
+		{
+			AMover* M = Cast<AMover>( Ed->Level->Element(i) );
+			if( !M )
+				continue;
+			if( Only[0] && appStricmp( M->GetName(), Only )!=0 )
+				continue;
+			UModel* B = M->Brush;
+			Count++;
+			if( !B )
+			{
+				GEdLog.Logf( "MOVERINFO %-9s tag=%-10s NO BRUSH", M->GetName(), *M->Tag );
+				continue;
+			}
+			FBox Bb = B->BoundingBox;
+			GEdLog.Logf
+			(
+				"MOVERINFO %-9s tag=%-10s polys=%-4i nodes=%-4i hulls=%-5i leaves=%-4i bounds=%-4i "
+				"col=%i blkA=%i blkP=%i box=(%.0f,%.0f,%.0f)-(%.0f,%.0f,%.0f) valid=%i",
+				M->GetName(), *M->Tag,
+				B->Polys ? B->Polys->Num() : -1,
+				B->Nodes ? B->Nodes->Num() : -1,
+				B->LeafHulls.Num(), B->Leaves.Num(), B->Bounds.Num(),
+				M->bCollideActors, M->bBlockActors, M->bBlockPlayers,
+				Bb.Min.X, Bb.Min.Y, Bb.Min.Z, Bb.Max.X, Bb.Max.Y, Bb.Max.Z,
+				Bb.IsValid
+			);
+			GEdLog.Logf
+			(
+				"          %-9s rootOutside=%i linked=%i moverLink=%u",
+				M->GetName(), B->RootOutside, B->Linked, B->MoverLink
+			);
+		}
+		GEdLog.Logf( "MOVERINFO: %i mover(s)", Count );
+		return 1;
+	}
+	else if( ParseCommand( &Str, "MOVERPROBE" ) )
+	{
+		// Ask a mover's brush the same question the running game asks it:
+		// UModel::PointCheck with a player-sized box, sampled over the volume
+		// the mover occupies in the world. PointCheck returns "outside", so a
+		// solid mover must report 0 (blocked) for interior samples -- a mover
+		// that reports 1 everywhere renders normally and is walked through.
+		char Want[NAME_SIZE]="";
+		Parse( Str, "NAME=", Want, ARRAY_COUNT(Want) );
+		FLOAT ER=17.f, EH=39.f;	// default human pawn extent
+		Parse( Str, "R=", ER ); Parse( Str, "H=", EH );
+		UEditorEngine* Ed = (UEditorEngine*)GEdEngine;
+		if( !Ed || !Ed->Level )
+		{
+			GEdLog.Logf( "MOVERPROBE: no level loaded" );
+			return 1;
+		}
+		for( INT i=0; i<Ed->Level->Num(); i++ )
+		{
+			AMover* M = Cast<AMover>( Ed->Level->Element(i) );
+			if( !M || !M->Brush )
+				continue;
+			if( Want[0] && appStricmp( M->GetName(), Want )!=0 )
+				continue;
+			FBox W = M->Brush->GetCollisionBoundingBox( M );
+			FVector Ext( ER, ER, EH );
+			INT Box=0, Pt=0, N=0;
+			const INT S=5;
+			for( INT a=0; a<S; a++ )
+			for( INT b=0; b<S; b++ )
+			for( INT c=0; c<S; c++ )
+			{
+				FVector P
+				(
+					W.Min.X + (W.Max.X-W.Min.X)*(a+0.5f)/S,
+					W.Min.Y + (W.Max.Y-W.Min.Y)*(b+0.5f)/S,
+					W.Min.Z + (W.Max.Z-W.Min.Z)*(c+0.5f)/S
+				);
+				FCheckResult H1(1.f), H2(1.f);
+				if( !M->Brush->PointCheck( H1, M, P, Ext, 0 ) )
+					Box++;
+				if( !M->Brush->PointCheck( H2, M, P, FVector(0,0,0), 0 ) )
+					Pt++;
+				N++;
+			}
+			GEdLog.Logf
+			(
+				"MOVERPROBE %-9s tag=%-10s world=(%.0f,%.0f,%.0f)-(%.0f,%.0f,%.0f) "
+				"blocked box=%i/%i point=%i/%i%s",
+				M->GetName(), *M->Tag,
+				W.Min.X, W.Min.Y, W.Min.Z, W.Max.X, W.Max.Y, W.Max.Z,
+				Box, N, Pt, N, Box ? "" : "   <== NEVER BLOCKS"
+			);
+		}
+		return 1;
+	}
 	return 0;
 }
 

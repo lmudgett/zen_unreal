@@ -163,6 +163,251 @@ static void ExitEngine( UEngine* Engine )
 }
 
 /*-----------------------------------------------------------------------------
+	Semisolid collision audit (-semisolid).
+-----------------------------------------------------------------------------*/
+
+// PF_Semisolid means "does not cut the BSP, but still blocks". Walk every BSP
+// node whose surface carries that flag, step a short way along -Normal (i.e.
+// into the material the surface faces away from) and ask the world whether
+// that point is solid. A correctly-collidable semisolid answers "solid"; one
+// that renders but does not block answers "open" and is walk-through.
+//
+// PF_NotSolid surfaces are audited alongside as a control: those are SUPPOSED
+// to read open, so if they behave differently from the semisolids the test
+// itself is sound.
+static void RunSemisolidAudit( ULevel* Level, const char* MapName )
+{
+	guard(RunSemisolidAudit);
+	UModel* M = Level->Model;
+	if( !M || !M->Nodes || !M->Surfs || !M->Verts || !M->Points )
+	{
+		debugf( NAME_Log, "SEMISOLID %-16s no model", MapName );
+		return;
+	}
+
+	FLOAT Depth = 6.f;
+	Parse( appCmdLine(), "SSDEPTH=", Depth );
+	INT Limit = 8;
+	Parse( appCmdLine(), "SSLIMIT=", Limit );
+
+	INT SemiTotal=0, SemiOpen=0, NotTotal=0, NotOpen=0, SolidTotal=0, SolidOpen=0;
+	INT Reported=0;
+	for( INT i=0; i<M->Nodes->Num(); i++ )
+	{
+		const FBspNode& N = M->Nodes->Element(i);
+		if( N.NumVertices < 3 || N.iSurf==INDEX_NONE )
+			continue;
+		const FBspSurf& S = M->Surfs->Element( N.iSurf );
+
+		INT Kind;	// 0 = plain solid, 1 = semisolid, 2 = not-solid
+		if     ( S.PolyFlags & PF_NotSolid  ) Kind = 2;
+		else if( S.PolyFlags & PF_Semisolid ) Kind = 1;
+		else                                  Kind = 0;
+
+		// Centroid of the node polygon.
+		FVector C(0,0,0);
+		for( INT v=0; v<N.NumVertices; v++ )
+			C += M->Points->Element( M->Verts->Element( N.iVertPool + v ).pVertex );
+		C /= (FLOAT)N.NumVertices;
+
+		// Step behind the face. FBspNode::Plane points out of the solid.
+		// Sample two depths and require BOTH open before calling it
+		// walk-through: a single deep sample punches out the far side of a
+		// thin brush and reports every thin semisolid as broken.
+		FVector Nrm( N.Plane.X, N.Plane.Y, N.Plane.Z );
+		FCheckResult H1(1.f), H2(1.f);
+		UBOOL Free
+			=  Level->SinglePointCheck( H1, C - Nrm*(Depth*0.25f), FVector(0,0,0), 0, Level->GetLevelInfo(), 0 )
+			&& Level->SinglePointCheck( H2, C - Nrm*Depth,         FVector(0,0,0), 0, Level->GetLevelInfo(), 0 );
+
+		if( Kind==1 ) { SemiTotal++;  if(Free) SemiOpen++; }
+		else if( Kind==2 ) { NotTotal++; if(Free) NotOpen++; }
+		else { SolidTotal++; if(Free) SolidOpen++; }
+
+		if( Kind==1 && Free && Reported<Limit )
+		{
+			debugf( NAME_Log, "SEMISOLID %-16s   walk-through at (%.0f,%.0f,%.0f) node %i surf %i",
+				MapName, C.X, C.Y, C.Z, i, N.iSurf );
+			Reported++;
+		}
+	}
+	debugf
+	(
+		NAME_Log,
+		"SEMISOLID %-16s semisolid %i/%i open (%.0f%%) | plain-solid %i/%i open (%.0f%%) | notsolid %i/%i open",
+		MapName,
+		SemiOpen, SemiTotal, SemiTotal ? 100.0*SemiOpen/SemiTotal : 0.0,
+		SolidOpen, SolidTotal, SolidTotal ? 100.0*SolidOpen/SolidTotal : 0.0,
+		NotOpen, NotTotal
+	);
+	unguard;
+}
+
+/*-----------------------------------------------------------------------------
+	Collision probe (-mapprobe).
+-----------------------------------------------------------------------------*/
+
+// Ask the *live* level the same question the player's movement asks it:
+// ULevel::SinglePointCheck with the pawn extent, walked along a line. This
+// goes through FCollisionHash -> AActor::IsBlockedBy -> UPrimitive::PointCheck,
+// so it sees exactly what a walking player would hit -- including movers that
+// are solid in isolation but never registered in the collision hash.
+//
+//   -mapprobe=x0:y0:z0:x1:y1:z1  (world-space segment, 32 samples). Colons,
+// not commas: Parse() truncates values at the first comma.
+static void RunMapProbe( UEngine* Engine )
+{
+	guard(RunMapProbe);
+	UGameEngine* Game = Cast<UGameEngine>( Engine );
+	if( !Game || !Game->GLevel )
+	{
+		debugf( NAME_Log, "MAPPROBE: no level" );
+		return;
+	}
+	ULevel* Level = Game->GLevel;
+
+	char Spec[256]="";
+	Parse( appCmdLine(), "MAPPROBE=", Spec, ARRAY_COUNT(Spec) );
+	FVector A(0,0,0), B(0,0,0);
+	if( sscanf( Spec, "%f:%f:%f:%f:%f:%f", &A.X,&A.Y,&A.Z, &B.X,&B.Y,&B.Z )!=6 )
+	{
+		debugf( NAME_Log, "MAPPROBE: need -mapprobe=x0:y0:z0:x1:y1:z1 (got '%s')", Spec );
+		return;
+	}
+
+	FLOAT ER=17.f, EH=39.f;
+	Parse( appCmdLine(), "PROBER=", ER );
+	Parse( appCmdLine(), "PROBEH=", EH );
+	FVector Extent( ER, ER, EH );
+
+	debugf( NAME_Log, "MAPPROBE: (%.0f,%.0f,%.0f) -> (%.0f,%.0f,%.0f) extent %.0fx%.0f",
+		A.X,A.Y,A.Z, B.X,B.Y,B.Z, ER, EH );
+
+	// -probetrigger=<tag> fires that event first and ticks the engine for
+	// -probesecs seconds, so the sweep sees the world after a mover has moved.
+	char TrigTag[NAME_SIZE]="";
+	if( Parse( appCmdLine(), "PROBETRIGGER=", TrigTag, ARRAY_COUNT(TrigTag) ) )
+	{
+		FName Want( TrigTag, FNAME_Find );
+		INT Fired=0;
+		for( INT i=0; i<Level->Num(); i++ )
+		{
+			AActor* Act = Level->Element(i);
+			if( Act && Act->Tag==Want )
+			{
+				Act->eventTrigger( Act, NULL );
+				Fired++;
+			}
+		}
+		FLOAT Secs=4.f;
+		Parse( appCmdLine(), "PROBESECS=", Secs );
+		debugf( NAME_Log, "MAPPROBE: triggered '%s' on %i actor(s), ticking %.1fs", TrigTag, Fired, Secs );
+		for( FLOAT T=0.f; T<Secs; T+=0.05f )
+		{
+			Engine->Tick( 0.05f );
+			for( INT i=0; i<Level->Num(); i++ )
+			{
+				AMover* M = Cast<AMover>( Level->Element(i) );
+				if( M && M->Tag==Want )
+					debugf( NAME_Log, "MAPPROBE   t=%4.2f %s key=%i loc=(%.0f,%.0f,%.0f)",
+						T+0.05f, M->GetName(), (INT)M->KeyNum, M->Location.X, M->Location.Y, M->Location.Z );
+			}
+		}
+	}
+
+	// -probemodel counts level-BSP points inside the probe segment's endpoints
+	// boxes, split into static points and the moving-brush points the
+	// FMovingBrushTracker injects past Points->Num(). Movers are drawn ONLY
+	// through that tracker (UnSprite.cpp: IsMovingBrush -> BrushTracker->
+	// Update), so this is where a mover would render at a stale position.
+	if( ParseParam( appCmdLine(), "PROBEMODEL" ) )
+	{
+		UVectors* Pts = Level->Model->Points;
+		FLOAT Rad = 96.f;
+		Parse( appCmdLine(), "PROBEBOX=", Rad );
+		INT SA=0, DA=0, SB=0, DB=0;
+		for( INT i=0; i<Pts->GetMax(); i++ )
+		{
+			const FVector& V = Pts->Element(i);
+			UBOOL Dyn = ( i >= Pts->GetNum() );
+			if( Abs(V.X-A.X)<Rad && Abs(V.Y-A.Y)<Rad && Abs(V.Z-A.Z)<Rad ) { if(Dyn) DA++; else SA++; }
+			if( Abs(V.X-B.X)<Rad && Abs(V.Y-B.Y)<Rad && Abs(V.Z-B.Z)<Rad ) { if(Dyn) DB++; else SB++; }
+		}
+		debugf( NAME_Log, "MAPPROBE model: points num=%i max=%i", Pts->GetNum(), Pts->GetMax() );
+		debugf( NAME_Log, "MAPPROBE model: near A (%.0f,%.0f,%.0f) static=%i moving=%i", A.X,A.Y,A.Z, SA, DA );
+		debugf( NAME_Log, "MAPPROBE model: near B (%.0f,%.0f,%.0f) static=%i moving=%i", B.X,B.Y,B.Z, SB, DB );
+	}
+
+	// -probegrid prints an ASCII occupancy map of the box A..B, one plate per
+	// Z slice: '.' = a pawn-sized box fits, '#' = world BSP blocks, a digit =
+	// blocked by a mover. Reveals leaks and pockets that line sweeps miss.
+	if( ParseParam( appCmdLine(), "PROBEGRID" ) )
+	{
+		FLOAT Step = 16.f;
+		Parse( appCmdLine(), "PROBESTEP=", Step );
+		Step = Clamp( Step, 4.f, 256.f );
+		for( FLOAT Z=A.Z; Z<=B.Z+0.01f; Z+=Step )
+		{
+			debugf( NAME_Log, "MAPGRID Z=%.0f   (rows = Y %.0f..%.0f, cols = X %.0f..%.0f, step %.0f)",
+				Z, A.Y, B.Y, A.X, B.X, Step );
+			for( FLOAT Y=A.Y; Y<=B.Y+0.01f; Y+=Step )
+			{
+				char Row[160]; INT n=0;
+				for( FLOAT X=A.X; X<=B.X+0.01f && n<ARRAY_COUNT(Row)-1; X+=Step )
+				{
+					FMemMark Mark(GMem);
+					char C='.';
+					for( FCheckResult* H = Level->MultiPointCheck( GMem, FVector(X,Y,Z), Extent, 0, Level->GetLevelInfo(), 1 ); H; H=H->GetNext() )
+					{
+						UBOOL IsWorld = ( H->Actor==NULL || H->Actor==(AActor*)Level->GetLevelInfo() );
+						if( IsWorld )                       { C='#'; break; }
+						else if( H->Actor->bBlockPlayers )  { C='M'; }
+					}
+					Mark.Pop();
+					Row[n++]=C;
+				}
+				Row[n]=0;
+				debugf( NAME_Log, "MAPGRID Y=%6.0f |%s|", Y, Row );
+			}
+		}
+	}
+
+	INT Steps = 32;
+	Parse( appCmdLine(), "PROBESTEPS=", Steps );
+	Steps = Clamp( Steps, 1, 256 );
+	for( INT i=0; i<=Steps; i++ )
+	{
+		FVector P = A + (B-A) * ((FLOAT)i/Steps);
+
+		// MultiPointCheck, not SinglePointCheck: the latter stops at the first
+		// overlap, which is usually a non-blocking Trigger cylinder and would
+		// hide whatever is behind it. Report only hits that would actually
+		// stop a player (world BSP, or an actor with bBlockPlayers).
+		FMemMark Mark(GMem);
+		char Blockers[256]=""; INT NumBlock=0, NumTouch=0;
+		for( FCheckResult* H = Level->MultiPointCheck( GMem, P, Extent, 0, Level->GetLevelInfo(), 1 ); H; H=H->GetNext() )
+		{
+			UBOOL IsWorld = ( H->Actor==NULL || H->Actor==(AActor*)Level->GetLevelInfo() );
+			if( IsWorld || H->Actor->bBlockPlayers )
+			{
+				NumBlock++;
+				if( appStrlen(Blockers) < 200 )
+				{
+					if( Blockers[0] ) appStrcat( Blockers, ", " );
+					appStrcat( Blockers, IsWorld ? "world BSP" : H->Actor->GetName() );
+				}
+			}
+			else NumTouch++;
+		}
+		Mark.Pop();
+
+		debugf( NAME_Log, "MAPPROBE %3i (%7.0f,%8.0f,%7.0f)  %-7s blockers=%i [%s] touches=%i",
+			i, P.X, P.Y, P.Z, NumBlock ? "SOLID" : "*OPEN*", NumBlock, Blockers, NumTouch );
+	}
+	unguard;
+}
+
+/*-----------------------------------------------------------------------------
 	Main loop.
 -----------------------------------------------------------------------------*/
 
@@ -194,11 +439,71 @@ static void MainLoop( UEngine* Engine )
 #if _WIN32
 	timeBeginPeriod( 1 ); // 1ms Sleep granularity for the cap below
 #endif
+	// -probeview=x:y:z:pitch:yaw pins the view actor at a world position for
+	// -probeframes frames, screenshots it (viewport "SHOT" exec) and quits.
+	// Non-interactive repro of a reported spot: no walking required.
+	FVector	ViewLoc(0,0,0);
+	FRotator ViewRot(0,0,0);
+	UBOOL	PinView = 0;
+	INT		ProbeFrames = 60, FrameNum = 0;
+	{
+		char Spec[256]="";
+		if( Parse( appCmdLine(), "PROBEVIEW=", Spec, ARRAY_COUNT(Spec) ) )
+		{
+			FLOAT X,Y,Z; INT Pitch,Yaw;
+			if( sscanf( Spec, "%f:%f:%f:%i:%i", &X,&Y,&Z, &Pitch, &Yaw )==5 )
+			{
+				ViewLoc = FVector(X,Y,Z);
+				ViewRot = FRotator(Pitch,Yaw,0);
+				PinView = 1;
+				Parse( appCmdLine(), "PROBEFRAMES=", ProbeFrames );
+				debugf( NAME_Log, "PROBEVIEW: pinning view at (%.0f,%.0f,%.0f) pitch=%i yaw=%i for %i frames",
+					X,Y,Z, Pitch, Yaw, ProbeFrames );
+			}
+			else debugf( NAME_Log, "PROBEVIEW: need -probeview=x:y:z:pitch:yaw (got '%s')", Spec );
+		}
+	}
+
 	DOUBLE StatWindowStart = OldTime;
 	INT    StatFrames = 0, StatSpikes = 0;
 	DOUBLE StatMax = 0.0, StatSum = 0.0, TickSum = 0.0, PrevTick = 0.0;
 	while( GIsRunning && !GIsRequestingExit )
 	{
+		char ProbeExec[128]="";
+		UBOOL HasExec = Parse( appCmdLine(), "PROBEEXEC=", ProbeExec, ARRAY_COUNT(ProbeExec) );
+		if( (PinView || HasExec) && Engine->Client )
+		{
+			// Freeze the view actor there: physics off and no world collision,
+			// otherwise gravity//pushout move it before the shot. Skipped when
+			// only -probeexec is given, so the actor stays wherever the map or
+			// save game put it (that is the point when inspecting a save).
+			if( PinView )
+			for( INT v=0; v<Engine->Client->Viewports.Num(); v++ )
+			{
+				APlayerPawn* P = Engine->Client->Viewports(v)->Actor;
+				if( !P )
+					continue;
+				P->Physics       = PHYS_None;
+				P->bCollideWorld = 0;
+				P->SetCollision( 0, 0, 0 );
+				P->Location      = ViewLoc;
+				P->Rotation      = ViewRot;
+				P->ViewRotation  = ViewRot;
+				P->Velocity      = FVector(0,0,0);
+				P->BaseEyeHeight = 0.f;
+				P->EyeHeight     = 0.f;
+			}
+			if( ++FrameNum == ProbeFrames )
+			{
+				if( HasExec )
+					Engine->Exec( ProbeExec, GSystem );
+				for( INT v=0; v<Engine->Client->Viewports.Num(); v++ )
+					Engine->Client->Viewports(v)->Exec( "SHOT", GSystem );
+				debugf( NAME_Log, "PROBEVIEW: screenshot taken, exiting" );
+				GIsRequestingExit = 1;
+			}
+		}
+
 		// Update the world. SDL event pumping happens inside the tick:
 		// UGameEngine::Tick -> Client->Tick -> SDLClient PumpEvents.
 		DOUBLE NewTime = appSeconds();
@@ -319,6 +624,22 @@ int main( int argc, char** argv )
 			if( GIsEditor && !GIsRequestingExit )
 				EdGuiInstall( Engine );
 #endif
+			if( !GIsRequestingExit && ParseParam( appCmdLine(), "SEMISOLID" ) )
+			{
+				UGameEngine* G = Cast<UGameEngine>( Engine );
+				if( G && G->GLevel )
+				{
+					char Name[128]="";
+					Parse( appCmdLine(), "SSNAME=", Name, ARRAY_COUNT(Name) );
+					RunSemisolidAudit( G->GLevel, Name[0] ? Name : "level" );
+				}
+				GIsRequestingExit = 1;
+			}
+			if( !GIsRequestingExit && ParseParam( appCmdLine(), "MAPPROBE" ) )
+			{
+				RunMapProbe( Engine );
+				GIsRequestingExit = 1;
+			}
 			if( !GIsRequestingExit )
 				MainLoop( Engine );
 #if UNREAL_WITH_EDGUI

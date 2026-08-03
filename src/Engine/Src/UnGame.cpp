@@ -226,6 +226,40 @@ UBOOL UGameEngine::Exec( const char* Cmd, FOutputDevice* Out )
 			SaveGame( appAtoi(Str) );
 		return 1;
 	}
+	else if( ParseCommand(&Str,"WHEREAMI") )
+	{
+		// Map-bug reporting aid: print where the view actor is, what zone it
+		// is in, and whether that spot is inside solid space -- the readout to
+		// quote when reporting "I clipped through X here".
+		if( !Client || Client->Viewports.Num()==0 || !Client->Viewports(0)->Actor )
+		{
+			Out->Log( "whereami: no viewport" );
+			return 1;
+		}
+		APlayerPawn* P = Client->Viewports(0)->Actor;
+		Out->Logf( "whereami: loc %.0f,%.0f,%.0f  rot pitch=%i yaw=%i  zone %i (%s)",
+			P->Location.X, P->Location.Y, P->Location.Z,
+			P->ViewRotation.Pitch & 65535, P->ViewRotation.Yaw & 65535,
+			P->Region.ZoneNumber, P->Region.Zone ? P->Region.Zone->GetName() : "none" );
+
+		if( GLevel )
+		{
+			FMemMark Mark(GMem);
+			FVector Extent( P->CollisionRadius, P->CollisionRadius, P->CollisionHeight );
+			INT Num=0;
+			for( FCheckResult* H = GLevel->MultiPointCheck( GMem, P->Location, Extent, 0, GLevel->GetLevelInfo(), 1 ); H; H=H->GetNext() )
+			{
+				UBOOL IsWorld = ( H->Actor==NULL || H->Actor==(AActor*)GLevel->GetLevelInfo() );
+				Out->Logf( "whereami:   overlapping %s%s", IsWorld ? "world BSP" : H->Actor->GetName(),
+					(IsWorld || H->Actor->bBlockPlayers) ? " (blocking)" : "" );
+				Num++;
+			}
+			Mark.Pop();
+			if( !Num )
+				Out->Log( "whereami:   overlapping nothing" );
+		}
+		return 1;
+	}
 	else if( ParseCommand( &Cmd, "CANCEL" ) )
 	{
 		if( GPendingLevel )
