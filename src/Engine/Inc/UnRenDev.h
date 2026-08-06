@@ -58,6 +58,14 @@ class ENGINE_API URenderDevice : public USubsystem
 	virtual void GetStats( char* Result )=0;
 	virtual void ReadPixels( FColor* Pixels )=0;
 	virtual void EndFlash() {};
+
+	// x64 port: eye-space Z of what has been rendered so far at frame-local
+	// pixel (X,Y), or 0 if the driver can't say. Lets the renderer occlude
+	// screen-space effects (lens flares/coronas) against everything actually
+	// drawn -- masked sheets, decoration meshes -- which collision traces
+	// can't see. Only meaningful between Lock and Unlock, after the world
+	// has been drawn, for perspective frames.
+	virtual FLOAT GetPixelDepth( FSceneNode* Frame, INT X, INT Y ) { return 0.f; }
 };
 
 /*------------------------------------------------------------------------------------

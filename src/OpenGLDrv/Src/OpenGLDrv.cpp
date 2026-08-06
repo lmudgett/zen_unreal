@@ -242,6 +242,7 @@ class DLL_EXPORT UOpenGLRenderDevice : public URenderDevice
 	void GetStats( char* Result );
 	void ReadPixels( FColor* Pixels );
 	void EndFlash();
+	FLOAT GetPixelDepth( FSceneNode* Frame, INT X, INT Y );
 
 	// Internals.
 	void SetSceneNode( FSceneNode* Frame );
@@ -1367,6 +1368,32 @@ void UOpenGLRenderDevice::ReadPixels( FColor* Pixels )
 	for( INT i=0; i<Y; i++ )
 		appMemcpy( Pixels + i*X, Buf + (Y-1-i)*X, X*sizeof(FColor) );
 	Mark.Pop();
+	unguard;
+}
+
+//
+// x64 port: eye-space Z of the pixel rendered so far at frame-local (X,Y).
+// Reads the depth buffer, so it sees exactly what was drawn -- including
+// alpha-tested masked surfaces and decoration meshes that collision traces
+// pass through. Translucent/modulated surfaces don't write depth (SetBlend),
+// so light through water/glass keeps its flare. Used by the corona/lens-flare
+// occlusion in Render.
+//
+FLOAT UOpenGLRenderDevice::GetPixelDepth( FSceneNode* Frame, INT X, INT Y )
+{
+	guard(UOpenGLRenderDevice::GetPixelDepth);
+	if( X<0 || Y<0 || X>=Frame->X || Y>=Frame->Y )
+		return 0.f;
+	GLfloat D = 1.f;
+	GLint WinX = Frame->XB + X;
+	GLint WinY = Viewport->SizeY - Frame->YB - Y - 1;
+	glReadPixels( WinX, WinY, 1, 1, GL_DEPTH_COMPONENT, GL_FLOAT, &D );
+	// Invert the SetSceneNode glFrustum mapping (keep zNear/zFar in sync
+	// with it): window depth D in [0,1] -> eye Z = n*f / (f - D*(f-n)).
+	const GLdouble zNear = 0.5, zFar = 49152.0;
+	if( D >= 1.f )
+		return (FLOAT)zFar;	// nothing rendered there: unoccluded
+	return (FLOAT)( (zNear*zFar) / (zFar - (GLdouble)D*(zFar-zNear)) );
 	unguard;
 }
 

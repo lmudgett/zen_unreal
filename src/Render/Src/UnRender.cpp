@@ -2549,6 +2549,11 @@ struct FCoronaLight
 	AActor* _Actor;
 	INT     iActor;
 	FLOAT   Bright;
+	// x64 port: smoothed screen-space occlusion factor (0=hidden, 1=clear),
+	// driven by RenDev->GetPixelDepth. Catches occluders the visibility trace
+	// can't see: masked sheets (tree canopies) and non-colliding decoration
+	// meshes the flare used to shine straight through.
+	FLOAT   Occl;
 };
 #define MAX_CORONA_LIGHTS 32
 static void GAddCorona( FSceneNode* Frame, FCoronaLight* CoronaLights, INT& iFree, AActor* Light, FLOAT Delta )
@@ -2583,6 +2588,7 @@ static void GAddCorona( FSceneNode* Frame, FCoronaLight* CoronaLights, INT& iFre
 				CoronaLights[iFree]._Actor = Light;
 				CoronaLights[iFree].iActor = Light->XLevel->GetActorIndex(Light);
 				CoronaLights[iFree].Bright = Min(1.f,2.f*Delta);
+				CoronaLights[iFree].Occl   = 0.f;	// fade in only once the depth test agrees
 			}
 		}
 	}
@@ -2881,6 +2887,28 @@ void URender::DrawFrame( FSceneNode* Frame )
 					FLOAT	Alpha = Light->LightSaturation / 255.0;
 					FVector Color = (Hue + Alpha * (FVector(1,1,1) - Hue));
 					FLOAT   RZ    = Frame->Proj.Z / Loc.Z;
+					FLOAT   PhysX = Loc.X * RZ + Frame->FX2;
+					FLOAT   PhysY = Loc.Y * RZ + Frame->FY2;
+
+					// x64 port: screen-space occlusion. The visibility trace in
+					// GAddCorona only sees colliding geometry, so the flare shone
+					// straight through masked sheets and non-colliding decoration
+					// meshes (tree trunks/canopies). Ask the render device what
+					// depth actually got drawn at the light's pixel and fade the
+					// corona out when something sits in front of it. Drivers that
+					// can't answer return 0 and everything behaves as before.
+					FLOAT Target = 1.f;
+					if( !Viewport->IsOrtho()
+					&&	PhysX>=0 && PhysX<Frame->X && PhysY>=0 && PhysY<Frame->Y )
+					{
+						FLOAT PixelZ = Viewport->RenDev->GetPixelDepth( Frame, appFloor(PhysX), appFloor(PhysY) );
+						if( PixelZ>0.f && PixelZ < Loc.Z*0.98f )
+							Target = 0.f;
+					}
+					CoronaLights[i].Occl = Clamp( CoronaLights[i].Occl + (Target>0.f ? Delta : -Delta), 0.f, 1.f );
+					if( CoronaLights[i].Occl <= 0.f )
+						continue;
+
 					// x64 port: the corona is positioned/sized in PHYSICAL screen pixels
 					// from the 3D projection, but it's drawn through Canvas->DrawIcon,
 					// whose DrawTile re-scales by the fixed-UI UIScale (=Frame->Y/720 at
@@ -2888,8 +2916,8 @@ void URender::DrawFrame( FSceneNode* Frame )
 					// intended physical position/size (else coronas drift bottom-right and
 					// balloon in size above 720p). No-op at/below 720p.
 					FLOAT   UIScale = Max( 1.f, (FLOAT)Frame->Y / 720.f );
-					FLOAT   X     = (Loc.X * RZ + Frame->FX2) / UIScale;
-					FLOAT   Y     = (Loc.Y * RZ + Frame->FY2) / UIScale;
+					FLOAT   X     = PhysX / UIScale;
+					FLOAT   Y     = PhysY / UIScale;
 					FLOAT   Scale = (512.f * Light->DrawScale * Frame->X/640) / UIScale;
 					/*for( int j=0; j<5; j++ )
 					{
@@ -2899,7 +2927,7 @@ void URender::DrawFrame( FSceneNode* Frame )
 						FLOAT Sc = Scale * (1.0-Abs(j-2)/2.2);
 						GRend->DrawIcon( Viewport, Light->Region.Zone->LensFlares[Abs(j-2)], XX-Sc/2, YY-Sc/2, Sc, Sc, NULL, 1.0, GCoronaLights[i].Bright * Color );
 					}*/
-					Viewport->Canvas->DrawIcon( Light->Skin, X-Scale/2, Y-Scale/2, Scale, Scale, NULL, 1.0, CoronaLights[i].Bright * Color, FPlane(0,0,0,0), PF_TwoSided | PF_Translucent );
+					Viewport->Canvas->DrawIcon( Light->Skin, X-Scale/2, Y-Scale/2, Scale, Scale, NULL, 1.0, CoronaLights[i].Bright * CoronaLights[i].Occl * Color, FPlane(0,0,0,0), PF_TwoSided | PF_Translucent );
 				}
 			}
 		}

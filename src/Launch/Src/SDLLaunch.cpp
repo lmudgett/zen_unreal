@@ -408,6 +408,47 @@ static void RunMapProbe( UEngine* Engine )
 }
 
 /*-----------------------------------------------------------------------------
+	Actor probe (-probeactors).
+-----------------------------------------------------------------------------*/
+
+// -probeactors[=<substr>] dumps every placed actor: class, name, location and
+// the render/occlusion facts that matter when reproducing a reported spot
+// (corona flag + skin on lights, mesh + collision on decorations). Optional
+// substring filters by class name. Non-interactive: log, then exit.
+static void RunActorProbe( UEngine* Engine )
+{
+	guard(RunActorProbe);
+	UGameEngine* Game = Cast<UGameEngine>( Engine );
+	if( !Game || !Game->GLevel )
+	{
+		debugf( NAME_Log, "ACTORPROBE: no level" );
+		return;
+	}
+	ULevel* Level = Game->GLevel;
+	char Filter[64]="";
+	Parse( appCmdLine(), "PROBEACTORS=", Filter, ARRAY_COUNT(Filter) );
+	INT Logged=0;
+	for( INT i=0; i<Level->Num(); i++ )
+	{
+		AActor* Act = Level->Element(i);
+		if( !Act )
+			continue;
+		if( Filter[0] && !appStrfind( const_cast<char*>(Act->GetClass()->GetName()), Filter ) )
+			continue;
+		debugf( NAME_Log, "ACTORPROBE %-22s %-26s (%7.0f,%8.0f,%7.0f) corona=%i skin=%s mesh=%s collide=%i",
+			Act->GetClass()->GetName(), Act->GetName(),
+			Act->Location.X, Act->Location.Y, Act->Location.Z,
+			(INT)Act->bCorona,
+			Act->Skin ? Act->Skin->GetName() : "None",
+			Act->Mesh ? Act->Mesh->GetName() : "None",
+			(INT)Act->bCollideActors );
+		Logged++;
+	}
+	debugf( NAME_Log, "ACTORPROBE: %i actor(s) logged (filter '%s')", Logged, Filter );
+	unguard;
+}
+
+/*-----------------------------------------------------------------------------
 	Main loop.
 -----------------------------------------------------------------------------*/
 
@@ -490,11 +531,110 @@ static void MainLoop( UEngine* Engine )
 		}
 	}
 
+	// -probelight=x:y:z spawns a corona-flagged test light there (steady,
+	// bright, GenFX.LensFlar skin). Deterministic repro for flare-occlusion
+	// bugs: place it behind a decoration/masked sheet, pin the view with
+	// -probeview, and the shot shows whether the corona is (in)correctly
+	// occluded -- no dependence on where a mapper happened to put one.
+	FVector	ProbeLightLoc(0,0,0);
+	UBOOL	ProbeLight = 0, ProbeLightPlaced = 0;
+	{
+		char Spec[256]="";
+		if( Parse( appCmdLine(), "PROBELIGHT=", Spec, ARRAY_COUNT(Spec) ) )
+		{
+			FLOAT X,Y,Z;
+			if( sscanf( Spec, "%f:%f:%f", &X,&Y,&Z )==3 )
+			{
+				ProbeLightLoc = FVector(X,Y,Z);
+				ProbeLight = 1;
+				debugf( NAME_Log, "PROBELIGHT: corona light at (%.0f,%.0f,%.0f)", X,Y,Z );
+			}
+			else debugf( NAME_Log, "PROBELIGHT: need -probelight=x:y:z (got '%s')", Spec );
+		}
+	}
+
+	// -probemesh=x:y:z:MeshName spawns a visible, non-colliding mesh actor
+	// there (an Effects actor wearing the mesh). Repro tool for "renders but
+	// doesn't collide" occlusion bugs: decorations and masked sheets never
+	// block collision traces, so this is how to put foliage in front of a
+	// corona light deterministically.
+	FVector	ProbeMeshLoc(0,0,0);
+	char	ProbeMeshName[64]="";
+	UBOOL	ProbeMesh = 0, ProbeMeshPlaced = 0;
+	{
+		char Spec[256]="";
+		if( Parse( appCmdLine(), "PROBEMESH=", Spec, ARRAY_COUNT(Spec) ) )
+		{
+			FLOAT X,Y,Z;
+			if( sscanf( Spec, "%f:%f:%f:%63s", &X,&Y,&Z, ProbeMeshName )==4 )
+			{
+				ProbeMeshLoc = FVector(X,Y,Z);
+				ProbeMesh = 1;
+				debugf( NAME_Log, "PROBEMESH: %s at (%.0f,%.0f,%.0f)", ProbeMeshName, X,Y,Z );
+			}
+			else debugf( NAME_Log, "PROBEMESH: need -probemesh=x:y:z:MeshName (got '%s')", Spec );
+		}
+	}
+
 	DOUBLE StatWindowStart = OldTime;
 	INT    StatFrames = 0, StatSpikes = 0;
 	DOUBLE StatMax = 0.0, StatSum = 0.0, TickSum = 0.0, PrevTick = 0.0;
 	while( GIsRunning && !GIsRequestingExit )
 	{
+		if( ProbeLight && !ProbeLightPlaced && Engine->Client )
+		{
+			UGameEngine* G = Cast<UGameEngine>( Engine );
+			if( G && G->GLevel )
+			{
+				ProbeLightPlaced = 1;
+				UClass* EC = FindObject<UClass>( ANY_PACKAGE, "Effects" );
+				UTexture* Flare = NULL;
+				for( TObjectIterator<UTexture> It; It; ++It )
+					if( appStrfind( const_cast<char*>(It->GetPathName()), "LensFlar" ) )
+						{ Flare = *It; break; }
+				AActor* L = EC ? G->GLevel->SpawnActor( EC, NAME_None, NULL, NULL, ProbeLightLoc, FRotator(0,0,0), NULL, 0, 1 ) : NULL;
+				if( L )
+				{
+					L->bHidden         = 1;
+					L->bDynamicLight   = 1;
+					L->bCorona         = 1;
+					L->LightType       = LT_Steady;
+					L->LightBrightness = 255;
+					L->LightHue        = 0;
+					L->LightSaturation = 255;
+					L->LightRadius     = 64;
+					L->LifeSpan        = 0.f;	// Effects subclasses default short-lived; keep it alive
+					L->DrawScale       = 0.25f;
+					L->Skin            = Flare;
+					debugf( NAME_Log, "PROBELIGHT: spawned %s at (%.0f,%.0f,%.0f) skin=%s",
+						L->GetName(), L->Location.X, L->Location.Y, L->Location.Z,
+						Flare ? Flare->GetName() : "None" );
+				}
+				else debugf( NAME_Log, "PROBELIGHT: spawn FAILED (class %s)", EC ? EC->GetName() : "'Effects' not found" );
+			}
+		}
+		if( ProbeMesh && !ProbeMeshPlaced && Engine->Client )
+		{
+			UGameEngine* G = Cast<UGameEngine>( Engine );
+			if( G && G->GLevel )
+			{
+				ProbeMeshPlaced = 1;
+				UClass* EC = FindObject<UClass>( ANY_PACKAGE, "Effects" );
+				UMesh* M = FindObject<UMesh>( ANY_PACKAGE, ProbeMeshName );
+				AActor* A = (EC && M) ? G->GLevel->SpawnActor( EC, NAME_None, NULL, NULL, ProbeMeshLoc, FRotator(0,0,0), NULL, 0, 1 ) : NULL;
+				if( A )
+				{
+					A->DrawType  = DT_Mesh;
+					A->Mesh      = M;
+					A->LifeSpan  = 0.f;
+					A->DrawScale = 1.f;
+					debugf( NAME_Log, "PROBEMESH: spawned %s mesh=%s at (%.0f,%.0f,%.0f)",
+						A->GetName(), M->GetName(), A->Location.X, A->Location.Y, A->Location.Z );
+				}
+				else debugf( NAME_Log, "PROBEMESH: spawn FAILED (class=%s mesh=%s)",
+					EC ? "ok" : "'Effects' missing", M ? "ok" : ProbeMeshName );
+			}
+		}
 		if( ProbeWalk && Engine->Client )
 		{
 			UGameEngine* G = Cast<UGameEngine>( Engine );
@@ -535,6 +675,7 @@ static void MainLoop( UEngine* Engine )
 			// otherwise gravity//pushout move it before the shot. Skipped when
 			// only -probeexec is given, so the actor stays wherever the map or
 			// save game put it (that is the point when inspecting a save).
+			UGameEngine* PinG = Cast<UGameEngine>( Engine );
 			if( PinView )
 			for( INT v=0; v<Engine->Client->Viewports.Num(); v++ )
 			{
@@ -544,7 +685,14 @@ static void MainLoop( UEngine* Engine )
 				P->Physics       = PHYS_None;
 				P->bCollideWorld = 0;
 				P->SetCollision( 0, 0, 0 );
-				P->Location      = ViewLoc;
+				// FarMoveActor, not a bare Location write: it updates the
+				// actor's Region (zone/leaf), which leaf-driven rendering --
+				// the corona light list above all -- reads. With a stale
+				// Region the shot silently loses every corona/flare.
+				if( PinG && PinG->GLevel )
+					PinG->GLevel->FarMoveActor( P, ViewLoc, 0, 1 );
+				else
+					P->Location  = ViewLoc;
 				P->Rotation      = ViewRot;
 				P->ViewRotation  = ViewRot;
 				P->Velocity      = FVector(0,0,0);
@@ -696,6 +844,11 @@ int main( int argc, char** argv )
 			if( !GIsRequestingExit && ParseParam( appCmdLine(), "MAPPROBE" ) )
 			{
 				RunMapProbe( Engine );
+				GIsRequestingExit = 1;
+			}
+			if( !GIsRequestingExit && ParseParam( appCmdLine(), "PROBEACTORS" ) )
+			{
+				RunActorProbe( Engine );
 				GIsRequestingExit = 1;
 			}
 			if( !GIsRequestingExit )
