@@ -1008,7 +1008,17 @@ void URender::AMD3DDrawMesh
 	if( Owner->bParticles )
 	{
 		guardSlow(Particles);
-		check(Owner->Texture);
+		// x64 port: content can reach here with Texture=None (a class whose
+		// default texture reference failed to resolve at script compile, or a
+		// script that cleared it at runtime). Retail assert-crashed the whole
+		// game on that; draw nothing instead.
+		if( !Owner->Texture )
+		{
+			DoFemms();
+			Mark.Pop();
+			STAT(unclock(GStat.MeshTime));
+			return;
+		}
 		FTransform** SortedPts = New<FTransform*>(GMem,Mesh->FrameVerts);
 		INT Count=0;
 		// No more x87 code until the next femms.
@@ -1368,7 +1378,16 @@ void URender::DrawMesh
 	if( Owner->bParticles )
 	{
 		guardSlow(Particles);
-		check(Owner->Texture);
+		// x64 port: content can reach here with Texture=None (a class whose
+		// default texture reference failed to resolve at script compile, or a
+		// script that cleared it at runtime). Retail assert-crashed the whole
+		// game on that; draw nothing instead.
+		if( !Owner->Texture )
+		{
+			Mark.Pop();
+			STAT(unclock(GStat.MeshTime));
+			return;
+		}
 		FTransform** SortedPts = New<FTransform*>(GMem,Mesh->FrameVerts);
 		INT Count=0;
 		for( INT i=0; i<Mesh->FrameVerts; i++ )

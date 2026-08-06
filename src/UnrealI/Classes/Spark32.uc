@@ -5,5 +5,5 @@ class Spark32 expands Spark3;
 
 defaultproperties
 {
-     Texture=FireTexture'fireeffect1.FireEffect1e'
+     Texture=FireTexture'UnrealI.Effect1.FireEffect1e'
 }

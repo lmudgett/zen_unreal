@@ -215,6 +215,39 @@ static void TestScripts()
 }
 
 /*-----------------------------------------------------------------------------
+	Particle-mesh defaults: every bParticles class must ship a texture.
+	The mesh renderer draws each vertex of a bParticles mesh as a sprite of
+	Owner->Texture; a class whose default Texture failed to resolve at script
+	compile time (e.g. a reference through a package name that no longer
+	exists) crashes the renderer the first time one is spawned.
+-----------------------------------------------------------------------------*/
+
+static void TestParticleDefaults()
+{
+	debugf( "SelfTest: --- Particle-mesh class defaults ---" );
+	INT Total=0, Bad=0;
+	for( TObjectIterator<UClass> It; It; ++It )
+	{
+		UClass* C = *It;
+		if( !C->IsChildOf(AActor::StaticClass) || C->Defaults.Num()==0 )
+			continue;
+		AActor* Def = (AActor*)C->GetDefaultObject();
+		if( Def->bParticles && Def->Mesh )
+		{
+			Total++;
+			if( !Def->Texture )
+			{
+				Bad++;
+				debugf( "SelfTest: bParticles class with Texture=None: %s", C->GetPathName() );
+			}
+		}
+	}
+	char Detail[64];
+	appSprintf( Detail, "(%i particle classes, %i missing textures)", Total, Bad );
+	TestResult( "particle-mesh classes have default textures", Total>0 && Bad==0, Detail );
+}
+
+/*-----------------------------------------------------------------------------
 	WAV parser: every retail sound must parse under the hardened reader.
 -----------------------------------------------------------------------------*/
 
@@ -253,6 +286,7 @@ INT RunSelfTests()
 	TestLoader();
 	TestObjectPins();
 	TestScripts();
+	TestParticleDefaults();
 	TestWavs();
 
 	debugf( "SelfTest: ============ %s: %i passed, %i failed ============",
