@@ -1210,12 +1210,39 @@ void UGameEngine::Tick( FLOAT DeltaSeconds )
 -----------------------------------------------------------------------------*/
 
 //
+// Is the level currently running the intro flyby (the main-menu backdrop)?
+// The intro is driven by UnrealI.Intro, which is a GameInfo but not a game:
+// there is no player, no inventory and no HUD to restore.
+//
+static UBOOL IsIntroLevel( ULevel* Level )
+{
+	guardSlow(IsIntroLevel);
+	if( !Level || !Level->GetLevelInfo()->Game )
+		return 0;
+	for( UClass* C=Level->GetLevelInfo()->Game->GetClass(); C; C=C->GetSuperClass() )
+		if( appStricmp( C->GetName(), "Intro" )==0 )
+			return 1;
+	return 0;
+	unguardSlow;
+}
+
+//
 // Save the current game state to a file.
 //
 void UGameEngine::SaveGame( INT Position )
 {
 	guard(UGameEngine::SaveGame);
 	char Filename[256];
+
+	// Saving the intro writes a slot that looks like a real save but restores
+	// into the menu backdrop. Refuse it here so every path is covered: the
+	// save menu, QuickSave and the "savegame N" console command.
+	if( IsIntroLevel( GLevel ) )
+	{
+		debugf( NAME_Log, "SaveGame %i refused: the intro is not a saveable game", Position );
+		return;
+	}
+
 	appMkdir( GSys->SavePath );
 	appSprintf( Filename, "%s\\Save%i.usa", GSys->SavePath, Position );
 	GLevel->GetLevelInfo()->LevelAction=LEVACT_Saving;

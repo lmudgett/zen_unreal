@@ -6,6 +6,14 @@ class UnrealSaveMenu expands UnrealSlotMenu
 	config;
 
 var localized string[128] CantSave;
+var localized string[128] CantSaveIntro;
+
+// The intro flyby behind the main menu has no game state worth saving.
+// Level.Game is None on a network client.
+function bool IsIntro()
+{
+	return (Level.Game != None) && Level.Game.IsA('Intro');
+}
 
 function BeginPlay()
 {
@@ -24,7 +32,7 @@ function bool ProcessSelection()
 {
 	local int Slot;
 
-	if ( PlayerOwner.Health <= 0 )
+	if ( (PlayerOwner.Health <= 0) || IsIntro() )
 		return true;
 
 	// Selection is a display position (newest first); resolve the real slot.
@@ -50,6 +58,13 @@ function bool ProcessSelection()
 function DrawMenu(canvas Canvas)
 {
 
+	if ( IsIntro() )
+	{
+		MenuTitle = CantSaveIntro;
+		DrawTitle(Canvas);
+		return;
+	}
+
 	if ( PlayerOwner.Health <= 0 )
 	{
 		MenuTitle = CantSave;
@@ -65,5 +80,6 @@ function DrawMenu(canvas Canvas)
 defaultproperties
 {
      CantSave="CAN'T SAVE WHEN DEAD"
+     CantSaveIntro="CAN'T SAVE THE INTRO"
      MenuTitle="SAVE GAME"
 }

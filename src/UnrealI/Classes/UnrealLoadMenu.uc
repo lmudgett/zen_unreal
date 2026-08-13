@@ -7,12 +7,22 @@ class UnrealLoadMenu expands UnrealSlotMenu
 
 var() localized string[32] RestartString;
 
+// The intro flyby behind the main menu is the menu backdrop, not a level you
+// can be sent (back) into. Level.Game is None on a network client.
+function bool IsIntro()
+{
+	return (Level.Game != None) && Level.Game.IsA('Intro');
+}
+
 function bool ProcessSelection()
 {
 	local int Slot;
 
 	if ( Selection == 1 )
 	{
+		// There is no restart entry to pick while the intro is running.
+		if ( IsIntro() )
+			return false;
 		PlayerOwner.ReStartLevel();
 		return true;
 	}
@@ -47,7 +57,8 @@ function DrawSlots(canvas Canvas)
 	Canvas.Font = Canvas.MedFont;
 
 	Canvas.SetPos(StartX, StartY);
-	Canvas.DrawText(RestartString$Level.Title, False);
+	if ( !IsIntro() )
+		Canvas.DrawText(RestartString$Level.Title, False);
 
 	For ( i=1; i<10; i++ )
 	{
