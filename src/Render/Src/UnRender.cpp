@@ -2714,12 +2714,12 @@ void URender::DrawFrame( FSceneNode* Frame )
 			{
 				PanV += ((INT)(Frame->Level->GetLevelInfo()->TimeSeconds * 35.f * Draw->Zone->TexVPanSpeed * 256.0)&0x3ffff)/256.0;
 			}
-			if( Surf->PolyFlags & (PF_SmallWavy | PF_BigWavy) )
-			{
-				FLOAT T = Frame->Level->GetLevelInfo()->TimeSeconds;
-				PanU += 8.0 * appSin(T) + 4.0 * appCos(2.3*T);
-				PanV += 8.0 * appCos(T) + 4.0 * appSin(2.3*T);
-			}
+			// x64 port: retail faked PF_SmallWavy/PF_BigWavy by sliding the whole
+			// texture with a rigid sinusoidal pan here -- a liquid surface read
+			// as a static picture being shifted around. The hardware driver now
+			// warps these surfaces internally instead (see OpenGLDrv
+			// DrawComplexSurface); the flags reach it via Surface.PolyFlags, so
+			// the rigid pan is retired rather than doubled up.
 
 			// Make SurfaceInfo.
 			FSurfaceInfo Surface;
@@ -2737,6 +2737,21 @@ void URender::DrawFrame( FSceneNode* Frame )
 			Texture->GetInfo( TextureMap, Viewport->CurrentTime );
 			TextureMap.Pan			= FVector( -PanU, -PanV, 0 );
 			Surface.Texture			= &TextureMap;
+
+			// x64 port: surfaces wearing a procedural water texture (WaterTexture
+			// subclasses Wave/Wet -- NOT FireTexture, which is fire, smoke and
+			// waterfall sheets) are marked wavy for the hardware driver's
+			// per-pixel liquid warp (see OpenGLDrv DrawComplexSurface). Mappers
+			// mostly relied on the baked ripple animation alone (e.g. NyLeve's
+			// Pond2 lake carries no liquid flags at all), so without this a pond
+			// draws as a flat translucent picture of ripples.
+			if( !(Surface.PolyFlags & (PF_SmallWavy|PF_BigWavy)) )
+				for( UClass* C=Texture->GetClass(); C; C=C->GetSuperClass() )
+					if( appStricmp( C->GetName(), "WaterTexture" )==0 )
+					{
+						Surface.PolyFlags |= PF_SmallWavy;
+						break;
+					}
 
 			// Make BumpMap.
 			FTextureInfo BumpMap;

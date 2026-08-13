@@ -143,6 +143,21 @@ class DLL_EXPORT UOpenGLRenderDevice : public URenderDevice
 	FLOAT			UMult, VMult;
 	UBOOL			TileDraw;	// inside DrawTile: translucent binds go mip-0-only (see SetTexture)
 
+	// Wavy-surface warp shader (see InitWavyProgram).
+	GLuint			WavyProgram;
+	GLint			WavyLocTime, WavyLocAmp, WavyLocUVMult;
+	GLint			WavyLocGloss, WavyLocBase, WavyLocLightOn, WavyLocUEdge, WavyLocVEdge;
+	GLint			WavyLocFlowV, WavyLocScroll, WavyLocBlob, WavyLocFoam;
+	UBOOL			WavyTried;
+
+	// Underwater full-screen distortion (see InitUnderwaterProgram / EndFlash).
+	GLuint			UnderwaterProgram;
+	GLint			UWLocTime, UWLocAmp, UWLocPx;
+	UBOOL			UnderwaterTried;
+	GLuint			UnderwaterTex;			// framebuffer copy the warp pass resamples
+	INT				UnderwaterTexW, UnderwaterTexH;
+	UBOOL			ViewerUnderwater;		// view origin is in a water zone (set per master frame)
+
 	// Frame state.
 	FPlane			FlashScale;
 	FPlane			FlashFog;
@@ -250,6 +265,8 @@ class DLL_EXPORT UOpenGLRenderDevice : public URenderDevice
 	void SetBlend( DWORD PolyFlags );
 	void SetTexture( FTextureInfo& Info, DWORD PolyFlags, UBOOL Clamp );
 	void UploadTexture( FTextureInfo& Info, DWORD PolyFlags, UBOOL SpriteTile );
+	void InitWavyProgram();
+	void InitUnderwaterProgram();
 	FLOAT EyeX( FSceneNode* Frame, FLOAT ScreenX, FLOAT Z ) { return (ScreenX - Frame->FX2) * Z / Frame->Proj.Z; }
 	FLOAT EyeY( FSceneNode* Frame, FLOAT ScreenY, FLOAT Z ) { return (ScreenY - Frame->FY2) * Z / Frame->Proj.Z; }
 };
@@ -260,6 +277,117 @@ IMPLEMENT_PACKAGE(OpenGLDrv);
 // Phase 5 (ImGui editor): post-render overlay hook, see OpenGLDrvHooks.h.
 #include "../Inc/OpenGLDrvHooks.h"
 OPENGLDRV_API void (*GGLPostRenderHook)( UViewport* Viewport ) = NULL;
+
+/*-----------------------------------------------------------------------------
+	Fragment-program plumbing (wavy surface warp, underwater view warp).
+-----------------------------------------------------------------------------*/
+
+typedef GLuint (APIENTRY *ZPFNGLCREATESHADER)( GLenum );
+typedef void   (APIENTRY *ZPFNGLSHADERSOURCE)( GLuint, GLsizei, const char* const*, const GLint* );
+typedef void   (APIENTRY *ZPFNGLCOMPILESHADER)( GLuint );
+typedef void   (APIENTRY *ZPFNGLGETSHADERIV)( GLuint, GLenum, GLint* );
+typedef void   (APIENTRY *ZPFNGLGETSHADERINFOLOG)( GLuint, GLsizei, GLsizei*, char* );
+typedef GLuint (APIENTRY *ZPFNGLCREATEPROGRAM)( void );
+typedef void   (APIENTRY *ZPFNGLATTACHSHADER)( GLuint, GLuint );
+typedef void   (APIENTRY *ZPFNGLLINKPROGRAM)( GLuint );
+typedef void   (APIENTRY *ZPFNGLGETPROGRAMIV)( GLuint, GLenum, GLint* );
+typedef void   (APIENTRY *ZPFNGLUSEPROGRAM)( GLuint );
+typedef GLint  (APIENTRY *ZPFNGLGETUNIFORMLOCATION)( GLuint, const char* );
+typedef void   (APIENTRY *ZPFNGLUNIFORM1F)( GLint, GLfloat );
+typedef void   (APIENTRY *ZPFNGLUNIFORM1I)( GLint, GLint );
+typedef void   (APIENTRY *ZPFNGLUNIFORM2F)( GLint, GLfloat, GLfloat );
+typedef void   (APIENTRY *ZPFNGLACTIVETEXTURE)( GLenum );
+typedef void   (APIENTRY *ZPFNGLMULTITEXCOORD2F)( GLenum, GLfloat, GLfloat );
+#ifndef GL_FRAGMENT_SHADER
+	#define GL_FRAGMENT_SHADER 0x8B30
+#endif
+#ifndef GL_COMPILE_STATUS
+	#define GL_COMPILE_STATUS 0x8B81
+#endif
+#ifndef GL_LINK_STATUS
+	#define GL_LINK_STATUS 0x8B82
+#endif
+#ifndef GL_TEXTURE0
+	#define GL_TEXTURE0 0x84C0
+	#define GL_TEXTURE1 0x84C1
+#endif
+
+static ZPFNGLUSEPROGRAM         ZglUseProgram;
+static ZPFNGLUNIFORM1F          ZglUniform1f;
+static ZPFNGLUNIFORM1I          ZglUniform1i;
+static ZPFNGLUNIFORM2F          ZglUniform2f;
+static ZPFNGLGETUNIFORMLOCATION ZglGetUniformLocation;
+static ZPFNGLACTIVETEXTURE      ZglActiveTexture;
+static ZPFNGLMULTITEXCOORD2F    ZglMultiTexCoord2f;
+
+static void* ZGLProc( const char* Name )
+{
+#if UNREAL_USE_SDL
+	return (void*)SDL_GL_GetProcAddress( Name );
+#else
+	return (void*)wglGetProcAddress( Name );
+#endif
+}
+
+// Compile and link a fragment-only program (fixed-function vertex path), bind
+// its "Tex" sampler to unit 0 and return the program id. 0 = no shader
+// support or compile/link failure; callers just skip their effect.
+static GLuint ZBuildFragmentProgram( const char* Src, const char* What )
+{
+	guard(ZBuildFragmentProgram);
+	ZPFNGLCREATESHADER       CreateShader       = (ZPFNGLCREATESHADER)      ZGLProc("glCreateShader");
+	ZPFNGLSHADERSOURCE       ShaderSource       = (ZPFNGLSHADERSOURCE)      ZGLProc("glShaderSource");
+	ZPFNGLCOMPILESHADER      CompileShader      = (ZPFNGLCOMPILESHADER)     ZGLProc("glCompileShader");
+	ZPFNGLGETSHADERIV        GetShaderiv        = (ZPFNGLGETSHADERIV)       ZGLProc("glGetShaderiv");
+	ZPFNGLGETSHADERINFOLOG   GetShaderInfoLog   = (ZPFNGLGETSHADERINFOLOG)  ZGLProc("glGetShaderInfoLog");
+	ZPFNGLCREATEPROGRAM      CreateProgram      = (ZPFNGLCREATEPROGRAM)     ZGLProc("glCreateProgram");
+	ZPFNGLATTACHSHADER       AttachShader       = (ZPFNGLATTACHSHADER)      ZGLProc("glAttachShader");
+	ZPFNGLLINKPROGRAM        LinkProgram        = (ZPFNGLLINKPROGRAM)       ZGLProc("glLinkProgram");
+	ZPFNGLGETPROGRAMIV       GetProgramiv       = (ZPFNGLGETPROGRAMIV)      ZGLProc("glGetProgramiv");
+	ZPFNGLUNIFORM1I          Uniform1i          = (ZPFNGLUNIFORM1I)         ZGLProc("glUniform1i");
+	ZglGetUniformLocation = (ZPFNGLGETUNIFORMLOCATION)ZGLProc("glGetUniformLocation");
+	ZglUseProgram = (ZPFNGLUSEPROGRAM)ZGLProc("glUseProgram");
+	ZglUniform1f  = (ZPFNGLUNIFORM1F) ZGLProc("glUniform1f");
+	ZglUniform1i  = Uniform1i;
+	ZglUniform2f  = (ZPFNGLUNIFORM2F) ZGLProc("glUniform2f");
+	// Multitexture (core since GL 1.3), used to fold the light map into the
+	// translucent base pass. Optional: callers must null-check before use.
+	ZglActiveTexture   = (ZPFNGLACTIVETEXTURE)  ZGLProc("glActiveTexture");
+	ZglMultiTexCoord2f = (ZPFNGLMULTITEXCOORD2F)ZGLProc("glMultiTexCoord2f");
+	if( !CreateShader || !ShaderSource || !CompileShader || !GetShaderiv || !CreateProgram
+	 || !AttachShader || !LinkProgram || !GetProgramiv || !ZglGetUniformLocation || !Uniform1i
+	 || !ZglUseProgram || !ZglUniform1f || !ZglUniform2f )
+	{
+		debugf( NAME_Init, "OpenGL: no shader support, %s disabled", What );
+		return 0;
+	}
+	GLuint Shader = CreateShader( GL_FRAGMENT_SHADER );
+	ShaderSource( Shader, 1, &Src, NULL );
+	CompileShader( Shader );
+	GLint Ok = 0;
+	GetShaderiv( Shader, GL_COMPILE_STATUS, &Ok );
+	if( !Ok )
+	{
+		char Log[1024]="";
+		if( GetShaderInfoLog ) GetShaderInfoLog( Shader, ARRAY_COUNT(Log), NULL, Log );
+		debugf( NAME_Init, "OpenGL: %s shader compile failed: %s", What, Log );
+		return 0;
+	}
+	GLuint Program = CreateProgram();
+	AttachShader( Program, Shader );
+	LinkProgram( Program );
+	GetProgramiv( Program, GL_LINK_STATUS, &Ok );
+	if( !Ok )
+	{
+		debugf( NAME_Init, "OpenGL: %s shader link failed", What );
+		return 0;
+	}
+	ZglUseProgram( Program );
+	Uniform1i( ZglGetUniformLocation( Program, "Tex" ), 0 );
+	ZglUseProgram( 0 );
+	return Program;
+	unguard;
+}
 
 /*-----------------------------------------------------------------------------
 	Construction and registration.
@@ -281,6 +409,29 @@ UOpenGLRenderDevice::UOpenGLRenderDevice()
 	CurrentFrame     = NULL;
 	CurrentBlendFlags= (DWORD)-1;
 	TileDraw         = 0;
+	WavyProgram      = 0;
+	WavyLocTime      = -1;
+	WavyLocAmp       = -1;
+	WavyLocUVMult    = -1;
+	WavyLocGloss     = -1;
+	WavyLocBase      = -1;
+	WavyLocLightOn   = -1;
+	WavyLocUEdge     = -1;
+	WavyLocVEdge     = -1;
+	WavyLocFlowV     = -1;
+	WavyLocScroll    = -1;
+	WavyLocBlob      = -1;
+	WavyLocFoam      = -1;
+	WavyTried        = 0;
+	UnderwaterProgram= 0;
+	UWLocTime        = -1;
+	UWLocAmp         = -1;
+	UWLocPx          = -1;
+	UnderwaterTried  = 0;
+	UnderwaterTex    = 0;
+	UnderwaterTexW   = -1;
+	UnderwaterTexH   = -1;
+	ViewerUnderwater = 0;
 	appMemset( BindMap, 0, sizeof(BindMap) );
 	AppliedGamma     = -1.f;
 	for( INT i=0; i<256; i++ ) GammaLUT[i] = (BYTE)i;	// identity until first UpdateGamma
@@ -487,6 +638,19 @@ void UOpenGLRenderDevice::Flush()
 		BindMap[i] = NULL;
 	}
 	CurrentTextureID = 0;
+	// Recompile the wavy warp program on next use: Flush accompanies context
+	// or mode changes, where the old program id may be stale. (The old object,
+	// if the context survived, is a few bytes -- not worth a delete-proc.)
+	WavyProgram = 0;
+	WavyTried   = 0;
+	UnderwaterProgram = 0;
+	UnderwaterTried   = 0;
+	// Unlike the programs, the underwater copy texture is screen-sized -- do
+	// delete it (a GL context is current whenever Flush runs, see above loop).
+	if( UnderwaterTex )
+		glDeleteTextures( 1, &UnderwaterTex );
+	UnderwaterTex  = 0;
+	UnderwaterTexW = UnderwaterTexH = -1;
 	unguard;
 }
 
@@ -660,6 +824,75 @@ void UOpenGLRenderDevice::ClearZ( FSceneNode* Frame )
 void UOpenGLRenderDevice::EndFlash()
 {
 	guard(UOpenGLRenderDevice::EndFlash);
+	// Underwater refraction: when the view origin is in a water zone (set by
+	// SetSceneNode), copy the finished 3D view into a texture and redraw it
+	// through the sinusoidal warp program -- the software renderer's
+	// underwater wobble, which the hardware drivers never had. Runs before
+	// the flash overlay (the tint is uniform; warping it adds nothing) and
+	// before the HUD, which the engine draws after EndFlash.
+	if( ViewerUnderwater && CurrentFrame && Viewport && !HitDataPtr )
+	{
+		if( !UnderwaterTried )
+			InitUnderwaterProgram();
+		FSceneNode* F = CurrentFrame;
+		while( F->Parent )
+			F = F->Parent;
+		INT W = F->X, H = F->Y;
+		if( UnderwaterProgram && W>0 && H>0 )
+		{
+			INT X0 = F->XB, Y0 = Viewport->SizeY - F->Y - F->YB;
+
+			// (Re)build the copy texture at the view size.
+			if( !UnderwaterTex )
+				glGenTextures( 1, &UnderwaterTex );
+			glBindTexture( GL_TEXTURE_2D, UnderwaterTex );
+			CurrentTextureID = 0;	// SetTexture must rebind after this pass
+			if( W!=UnderwaterTexW || H!=UnderwaterTexH )
+			{
+				glTexImage2D( GL_TEXTURE_2D, 0, GL_RGB8, W, H, 0, GL_RGB, GL_UNSIGNED_BYTE, NULL );
+				glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR );
+				glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR );
+				glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE );
+				glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE );
+				UnderwaterTexW = W;
+				UnderwaterTexH = H;
+			}
+			glCopyTexSubImage2D( GL_TEXTURE_2D, 0, 0, 0, X0, Y0, W, H );
+
+			ALevelInfo* Info = F->Level ? F->Level->GetLevelInfo() : NULL;
+			DOUBLE T = Info ? (DOUBLE)Info->TimeSeconds : 0.0;
+			glViewport( X0, Y0, W, H );
+			glDisable( GL_DEPTH_TEST );
+			glDisable( GL_BLEND );
+			glDisable( GL_ALPHA_TEST );
+			ZglUseProgram( UnderwaterProgram );
+			// Wrap where every wave rate (multiples of 0.05 rad/s) completes.
+			ZglUniform1f( UWLocTime, (FLOAT)fmod( T, 125.66370614359172 ) );
+			ZglUniform1f( UWLocAmp, Max( 3.f, H/240.f ) );	// pixels: ~4.5 at 1080p
+			ZglUniform2f( UWLocPx, 1.f/W, 1.f/H );
+			glMatrixMode( GL_PROJECTION );
+			glPushMatrix();
+			glLoadIdentity();
+			glMatrixMode( GL_MODELVIEW );
+			glPushMatrix();
+			glLoadIdentity();
+			glColor3f( 1.f, 1.f, 1.f );
+			glBegin( GL_QUADS );
+			glTexCoord2f( 0, 0 ); glVertex2f( -1, -1 );
+			glTexCoord2f( 1, 0 ); glVertex2f(  1, -1 );
+			glTexCoord2f( 1, 1 ); glVertex2f(  1,  1 );
+			glTexCoord2f( 0, 1 ); glVertex2f( -1,  1 );
+			glEnd();
+			ZglUseProgram( 0 );
+			glPopMatrix();
+			glMatrixMode( GL_PROJECTION );
+			glPopMatrix();
+			glMatrixMode( GL_MODELVIEW );
+			glEnable( GL_DEPTH_TEST );
+			CurrentBlendFlags = (DWORD)-1;
+			CurrentFrame = NULL;	// next SetSceneNode must re-apply the viewport
+		}
+	}
 	if( FlashScale!=FPlane(0.5f,0.5f,0.5f,0.f) || FlashFog!=FPlane(0.f,0.f,0.f,0.f) )
 	{
 		// Blend a full-screen quad: out = FlashFog + dst * 2*FlashScale.
@@ -736,6 +969,22 @@ void UOpenGLRenderDevice::SetSceneNode( FSceneNode* Frame )
 		FogRGB[1]  = Zone->FogColor.G/255.f;
 		FogRGB[2]  = Zone->FogColor.B/255.f;
 		FogEnd     = Zone->FogDistance;
+	}
+
+	// Underwater view warp (see EndFlash): does the view origin itself sit in
+	// a water zone? Recomputed from the BSP rather than read off the player
+	// actor -- Region is the body's zone (wrong when wading with the camera
+	// above the surface, and stale on pinned probe cameras); this matches how
+	// Render resolves the view zone (UnRender.cpp SetupFrame). Root frames
+	// only: sky/mirror child frames have their own unrelated origins.
+	if( !Frame->Parent )
+	{
+		ViewerUnderwater = 0;
+		if( !GIsEditor && Frame->Level && Frame->Level->Model && Frame->Level->GetLevelInfo() )
+		{
+			AZoneInfo* VZone = Frame->Level->Model->PointRegion( Frame->Level->GetLevelInfo(), Frame->Coords.Origin ).Zone;
+			ViewerUnderwater = VZone && VZone->bWaterZone;
+		}
 	}
 	unguard;
 }
@@ -1080,6 +1329,179 @@ void UOpenGLRenderDevice::UploadTexture( FTextureInfo& Info, DWORD PolyFlags, UB
 	Complex surfaces (BSP).
 -----------------------------------------------------------------------------*/
 
+// PF_SmallWavy/PF_BigWavy liquid surfaces, plus translucent auto-panning ones
+// (flowing water: rivers, waterfalls). Retail v200 faked wavy by sliding the
+// whole texture with a rigid sinusoidal pan (in Render's UnRender.cpp, now
+// retired), and auto-pan alone slides the picture rigidly along the flow -- a
+// liquid read as a static picture being shifted around. Instead, warp the
+// texture lookup per PIXEL: a sinusoidal texel-space UV offset, phase keyed to
+// the surface's own texel coordinates, so the image undulates internally like
+// liquid. Two superimposed waves per axis keep the pattern from reading as
+// periodic. (For auto-panning surfaces the phase key includes the pan offset,
+// so the ripples travel with the current -- flowing water shimmers as it
+// flows.)
+//
+// Translucent wavy/panning surfaces read as WATER and additionally get
+// slope-keyed glint shading (Gloss: brightness rides the wave slope, like
+// light catching ripples -- a cheap reflectivity cue) and a slight base fade
+// (BaseMul<1: under the engine's ONE/ONE_MINUS_SRC_COLOR translucency a dimmer
+// source lets more of what's beyond show through). OPAQUE wavy surfaces
+// (slime, lava) keep the plain warp: Gloss=0, BaseMul=1.
+//
+// Per-pixel (a fragment program on the base pass only) rather than per-vertex
+// over a tessellated grid: a tessellated version drew each cell with a
+// constant UV gradient that jumped every frame as the warp moved, so at
+// minification neighboring cells flickered between mip levels -- visible
+// strobing. The shader's UV field is smooth, so its derivatives (and mip
+// selection) are too, and the pass draws the exact same fan as every other
+// pass, so depth and coverage stay consistent for the light-map/fog passes.
+// If the context has no shader support, the surface just draws unwarped.
+void UOpenGLRenderDevice::InitWavyProgram()
+{
+	guard(UOpenGLRenderDevice::InitWavyProgram);
+	WavyTried = 1;
+
+	// Wave numbers are 2pi/64, 2pi/96, 2pi/80 texels. The glint term is the
+	// analytic slope of the displacement field, rescaled to [-1,1].
+	static const char* Src =
+		"#version 120\n"
+		"uniform sampler2D Tex;\n"
+		"uniform float Time;\n"
+		"uniform float Amp;\n"			// amplitude in texels
+		"uniform vec2 UVMult;\n"		// driver's UMult/VMult: texcoord units per texel
+		"uniform float Gloss;\n"		// slope-glint strength (water only, else 0)
+		"uniform float BaseMul;\n"		// base color scale (water only, else 1)
+		"uniform sampler2D LightTex;\n"	// light map on unit 1 (when LightOn)
+		"uniform float LightOn;\n"		// 1 = multiply by 2x light map (lit translucent)
+		"uniform vec2 UEdge;\n"			// texcoord-u extent of a stream sheet; y<=x disables
+		"uniform vec2 VEdge;\n"			// texcoord-v extent of a stream sheet; y<=x disables
+		"uniform float FlowV;\n"		// 1 = stream flows along t, 0 = along s
+		"uniform float Scroll;\n"		// texture scroll along the flow (texcoord units)
+		"uniform float Blob;\n"			// 0 = stream sheet, 1 = radial droplet, 2 = band (ripple ring)
+		"uniform float Foam;\n"			// 1 = desaturate toward white (froth)
+		"void main()\n"
+		"{\n"
+		"	vec2 t = gl_TexCoord[0].st / UVMult;\n"
+		"	float a1 = t.y*0.0981748 + 2.1*Time;\n"
+		"	float a2 = (t.x+t.y)*0.0654498 - 1.6*Time;\n"
+		"	float b1 = t.x*0.0981748 + 1.9*Time;\n"
+		"	float b2 = (t.x-t.y)*0.0785398 + 1.3*Time;\n"
+		"	float dU = Amp*( 0.6*sin(a1) + 0.4*sin(a2) );\n"
+		"	float dV = Amp*( 0.6*cos(b1) + 0.4*cos(b2) );\n"
+		// Stream sheets scroll the droplet texture along the fall -- fast
+		// coherent downward motion is what reads as RUNNING water; the
+		// fractal animation alone just simmers in place.
+		"	vec2 uv = gl_TexCoord[0].st + vec2(dU,dV)*UVMult;\n"
+		"	uv -= mix( vec2(Scroll,0.0), vec2(0.0,Scroll), FlowV );\n"
+		"	vec4 C = texture2D( Tex, uv ) * gl_Color;\n"
+		// Light is clamped at 1.0: overbright (the opaque Pass-2 modulate goes
+		// to 2x) saturates every texel of a self-lit stream to a solid block
+		// of color, erasing the droplet contrast that makes it read as water.
+		"	C.rgb *= mix( vec3(1.0), min( texture2D( LightTex, gl_TexCoord[1].st ).rgb*2.0, vec3(1.0) ), LightOn );\n"
+		"	float g = 0.5*( 0.6*cos(a1) + 0.4*cos(a2) - 0.6*sin(b1) - 0.4*sin(b2) );\n"
+		"	C.rgb *= BaseMul*( 1.0 + Gloss*g );\n"
+		// Lateral edge fade for stream sheets: a fountain column is a
+		// hard-edged quad, and under additive translucency dark = transparent,
+		// so rounding the sides off in RGB reads as a narrowing stream. The
+		// band is capped at 20 texels so a wide lit sheet only vignettes.
+		// Stream shaping: a flat quad reads as a round JET when its brightness
+		// follows a cylinder profile across the width -- bright core, limbs
+		// falling to nothing (no hard edges to read as a box). Along the flow
+		// a short band melts each end into whatever it pours from and into.
+		"	float w = UEdge.y - UEdge.x;\n"
+		"	float h = VEdge.y - VEdge.x;\n"
+		"	if( w > 0.0 && h > 0.0 )\n"
+		"	{\n"
+		"		float cu = clamp( (gl_TexCoord[0].s - UEdge.x)/w, 0.0, 1.0 );\n"
+		"		float cv = clamp( (gl_TexCoord[0].t - VEdge.x)/h, 0.0, 1.0 );\n"
+		"		if( Blob > 1.5 )\n"
+		"		{\n"
+		// Ripple ring: soft band across its width, unbroken along its length
+		// (so ring segments join seamlessly).
+		"			float cx = mix( cv, cu, FlowV );\n"
+		"			float p = 4.0*cx*(1.0-cx);\n"
+		"			C.rgb *= p*( 0.55 + 0.75*p );\n"
+		"		}\n"
+		"		else if( Blob > 0.5 )\n"
+		"		{\n"
+		// Fountain particle: soft radial droplet, texture detail inside.
+		"			vec2 q = vec2(cu,cv)*2.0 - 1.0;\n"
+		"			C.rgb *= max( 1.0 - dot(q,q), 0.0 );\n"
+		"		}\n"
+		"		else\n"
+		"		{\n"
+		"			float cx = mix( cv, cu, FlowV );\n"	// across the stream
+		"			float fl = mix( cu, cv, FlowV );\n"	// along the flow
+		"			float p = 4.0*cx*(1.0-cx);\n"
+		"			C.rgb *= p*( 0.6 + 0.7*p );\n"
+		"			C.rgb *= smoothstep( 0.0, 0.12, fl ) * ( 1.0 - smoothstep( 0.88, 1.0, fl ) );\n"
+		"		}\n"
+		"	}\n"
+		// Froth is aerated water: nearly white, keeping a trace of the
+		// liquid's own tint so it still belongs to the pool it sits on.
+		"	C.rgb = mix( C.rgb, vec3( dot( C.rgb, vec3(0.3,0.59,0.11) ) )*1.25 + C.rgb*0.20, Foam );\n"
+		"	gl_FragColor = C;\n"
+		"}\n";
+
+	GLuint Program = ZBuildFragmentProgram( Src, "wavy surface warp" );
+	if( !Program )
+		return;
+	WavyLocTime    = ZglGetUniformLocation( Program, "Time" );
+	WavyLocAmp     = ZglGetUniformLocation( Program, "Amp" );
+	WavyLocUVMult  = ZglGetUniformLocation( Program, "UVMult" );
+	WavyLocGloss   = ZglGetUniformLocation( Program, "Gloss" );
+	WavyLocBase    = ZglGetUniformLocation( Program, "BaseMul" );
+	WavyLocLightOn = ZglGetUniformLocation( Program, "LightOn" );
+	WavyLocUEdge   = ZglGetUniformLocation( Program, "UEdge" );
+	WavyLocVEdge   = ZglGetUniformLocation( Program, "VEdge" );
+	WavyLocFlowV   = ZglGetUniformLocation( Program, "FlowV" );
+	WavyLocScroll  = ZglGetUniformLocation( Program, "Scroll" );
+	WavyLocBlob    = ZglGetUniformLocation( Program, "Blob" );
+	WavyLocFoam    = ZglGetUniformLocation( Program, "Foam" );
+	ZglUseProgram( Program );
+	ZglUniform1i( ZglGetUniformLocation( Program, "LightTex" ), 1 );
+	ZglUseProgram( 0 );
+	WavyProgram    = Program;
+	debugf( NAME_Init, "OpenGL: wavy surface warp shader ready" );
+	unguard;
+}
+
+// Full-screen refraction for a submerged camera (see EndFlash): the finished
+// 3D view, resampled through a sinusoidal screen-space warp. Amp is in
+// pixels; Px is 1/view size, and the sample point is clamped half a pixel
+// inside the copy so the warp never reads beyond the view rect.
+void UOpenGLRenderDevice::InitUnderwaterProgram()
+{
+	guard(UOpenGLRenderDevice::InitUnderwaterProgram);
+	UnderwaterTried = 1;
+
+	static const char* Src =
+		"#version 120\n"
+		"uniform sampler2D Tex;\n"
+		"uniform float Time;\n"
+		"uniform float Amp;\n"			// amplitude in pixels
+		"uniform vec2 Px;\n"			// 1 / view size in pixels
+		"void main()\n"
+		"{\n"
+		"	vec2 uv = gl_TexCoord[0].st;\n"
+		"	vec2 d;\n"
+		"	d.x = sin( uv.y*11.0 + 1.90*Time ) + 0.55*sin( uv.y*23.0 - 2.60*Time );\n"
+		"	d.y = cos( uv.x*13.0 + 1.60*Time ) + 0.55*cos( uv.x*19.0 + 2.20*Time );\n"
+		"	uv += d*Amp*Px;\n"
+		"	gl_FragColor = texture2D( Tex, clamp( uv, 0.5*Px, vec2(1.0)-0.5*Px ) );\n"
+		"}\n";
+
+	GLuint Program = ZBuildFragmentProgram( Src, "underwater view warp" );
+	if( !Program )
+		return;
+	UWLocTime = ZglGetUniformLocation( Program, "Time" );
+	UWLocAmp  = ZglGetUniformLocation( Program, "Amp" );
+	UWLocPx   = ZglGetUniformLocation( Program, "Px" );
+	UnderwaterProgram = Program;
+	debugf( NAME_Init, "OpenGL: underwater view warp shader ready" );
+	unguard;
+}
+
 void UOpenGLRenderDevice::DrawComplexSurface( FSceneNode* Frame, FSurfaceInfo& Surface, FSurfaceFacet& Facet )
 {
 	guard(UOpenGLRenderDevice::DrawComplexSurface);
@@ -1097,11 +1519,88 @@ void UOpenGLRenderDevice::DrawComplexSurface( FSceneNode* Frame, FSurfaceInfo& S
 
 	UBOOL Masked = (Surface.PolyFlags & PF_Masked)!=0;
 
-	// Pass 1: base texture (or flat color).
+	// Pass 1: base texture (or flat color). PF_SmallWavy/PF_BigWavy -- and
+	// translucent auto-panning surfaces, i.e. flowing water -- bind the
+	// per-pixel warp program for this pass only (see InitWavyProgram): same
+	// fan, same depth, only the texture lookup undulates.
 	SetBlend( Surface.PolyFlags );
+	UBOOL LightDone = 0;	// light map folded into the base pass below
 	if( Surface.Texture )
 	{
+		UBOOL Translucent = (Surface.PolyFlags & PF_Translucent)!=0 && !(Surface.PolyFlags & PF_Modulated);
+		UBOOL WavyFlags   = (Surface.PolyFlags & (PF_SmallWavy|PF_BigWavy))!=0;
+		// Flow warp only in the root frame: sky boxes layer translucent
+		// auto-panning cloud sheets, and those must keep sliding rigidly.
+		UBOOL Flowing = Translucent && Frame->Parent==NULL && !WavyFlags
+		             && (Surface.PolyFlags & (PF_AutoUPan|PF_AutoVPan))!=0;
+		// Water look (glints, base fade, livelier time) is for translucent
+		// LIQUID surfaces; a merely lit-translucent sheet (below) gets none.
+		UBOOL WaterFX = Flowing || (WavyFlags && Translucent);
+		// The shader serves warped surfaces AND lit translucent ones. For the
+		// latter it multiplies the base texel by its own 2x light map in this
+		// single pass (unit 1) instead of the Pass-2 framebuffer modulate:
+		// DST_COLOR modulate over an additive-translucent base darkens
+		// everything seen THROUGH the surface by the surface's lighting -- a
+		// dim-lit waterfall rendered as a dark glassy slab over the scene
+		// behind it. Software-renderer translucency lit the texel, never the
+		// backdrop.
+		UBOOL Wavy = Flowing || WavyFlags || (Translucent && Surface.LightMap);
+		if( Wavy && !WavyTried )
+			InitWavyProgram();
+		Wavy = Wavy && WavyProgram!=0;
+		UBOOL FoldLight = Wavy && Translucent && Surface.LightMap
+		               && ZglActiveTexture && ZglMultiTexCoord2f;
+		if( !WavyFlags && !Flowing && !FoldLight )
+			Wavy = 0;	// lit-translucent was the only reason, and it needs multitexture
+
 		SetTexture( *Surface.Texture, Surface.PolyFlags, 0 );
+		FLOAT BaseUM = UMult, BaseVM = VMult;
+		FLOAT LightUM = 0.f, LightVM = 0.f;
+		if( FoldLight )
+		{
+			// Bind the light map on unit 1 (SetTexture binds on the active
+			// unit and handles dynamic-light re-uploads). The bind cache then
+			// describes unit 1, so poison it: the next SetTexture must rebind
+			// on unit 0 even if the cache id happens to match.
+			ZglActiveTexture( GL_TEXTURE1 );
+			SetTexture( *Surface.LightMap, 0, 1 );
+			LightUM = UMult;
+			LightVM = VMult;
+			ZglActiveTexture( GL_TEXTURE0 );
+			CurrentTextureID = 0;
+			LightDone = 1;
+		}
+		DOUBLE T = 0.0;
+		if( Wavy )
+		{
+			// Wrap time at the waves' common period (every rate, including
+			// the water-speed 1.5x variants, is a multiple of 0.05 rad/s ->
+			// period 2pi/0.05) so the shader's float phase stays small and
+			// continuous forever -- raw TimeSeconds from a long-played save
+			// quantizes sin() into visible per-frame jumps.
+			ALevelInfo* Info = Frame->Level ? Frame->Level->GetLevelInfo() : NULL;
+			T = Info ? (DOUBLE)Info->TimeSeconds : 0.0;
+			ZglUseProgram( WavyProgram );
+			ZglUniform1f( WavyLocTime, (FLOAT)fmod( WaterFX ? T*1.5 : T, 125.66370614359172 ) );
+			// Flowing surfaces warp gently (the pan supplies the motion);
+			// wavy pools use the tuned amplitudes; lit translucent sheets
+			// (fountain streams pouring from statues, and their kin) get a
+			// slight sway -- their procedural animation supplies the fall,
+			// the sway keeps the column from reading as a rigid slab.
+			ZglUniform1f( WavyLocAmp, Flowing ? 2.5f : WavyFlags ? ((Surface.PolyFlags & PF_BigWavy) ? 7.f : 3.5f) : 1.5f );
+			ZglUniform2f( WavyLocUVMult, BaseUM, BaseVM );
+			ZglUniform1f( WavyLocGloss, WaterFX ? 0.22f : 0.15f );
+			ZglUniform1f( WavyLocBase,  WaterFX ? 0.88f : 1.f );
+			ZglUniform1f( WavyLocLightOn, FoldLight ? 1.f : 0.f );
+			// No stream shaping: the shader's sheet and droplet profiles stay
+			// off unless a caller asks for them.
+			ZglUniform2f( WavyLocUEdge, 0.f, 0.f );
+			ZglUniform2f( WavyLocVEdge, 0.f, 0.f );
+			ZglUniform1f( WavyLocFlowV, 1.f );
+			ZglUniform1f( WavyLocScroll, 0.f );
+			ZglUniform1f( WavyLocBlob, 0.f );
+			ZglUniform1f( WavyLocFoam, 0.f );
+		}
 		glColor3f( 1.f, 1.f, 1.f );
 		for( FSavedPoly* Poly=Facet.Polys; Poly; Poly=Poly->Next )
 		{
@@ -1111,12 +1610,18 @@ void UOpenGLRenderDevice::DrawComplexSurface( FSceneNode* Frame, FSurfaceInfo& S
 				FVector& P = Poly->Pts[i]->Point;
 				FLOAT U = Facet.MapCoords.XAxis | (P - Facet.MapCoords.Origin);
 				FLOAT V = Facet.MapCoords.YAxis | (P - Facet.MapCoords.Origin);
-				glTexCoord2f( (U-Surface.Texture->Pan.X)*UMult, (V-Surface.Texture->Pan.Y)*VMult );
+				if( FoldLight )
+					ZglMultiTexCoord2f( GL_TEXTURE1,
+						(U-Surface.LightMap->Pan.X+0.5f*Surface.LightMap->UScale)*LightUM,
+						(V-Surface.LightMap->Pan.Y+0.5f*Surface.LightMap->VScale)*LightVM );
+				glTexCoord2f( (U-Surface.Texture->Pan.X)*BaseUM, (V-Surface.Texture->Pan.Y)*BaseVM );
 				glVertex3f( P.X, P.Y, P.Z );
 			}
 			glEnd();
 			PolyCount++;
 		}
+		if( Wavy )
+			ZglUseProgram( 0 );
 	}
 
 	// Subsequent passes hit exactly the pixels the base pass resolved.
@@ -1173,7 +1678,9 @@ void UOpenGLRenderDevice::DrawComplexSurface( FSceneNode* Frame, FSurfaceInfo& S
 	}
 
 	// Pass 2: light map, 2x modulated (Unreal light maps are half-bright).
-	if( Surface.LightMap )
+	// Skipped when the base pass already folded the light map in (lit
+	// translucent surfaces -- see above).
+	if( Surface.LightMap && !LightDone )
 	{
 		glDisable( GL_ALPHA_TEST );
 		glEnable( GL_BLEND );
