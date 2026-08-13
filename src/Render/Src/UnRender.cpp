@@ -2597,6 +2597,52 @@ static void GAddCorona( FSceneNode* Frame, FCoronaLight* CoronaLights, INT& iFre
 //
 // Draw the entire world.
 //
+/*-----------------------------------------------------------------------------
+	Unclipped per-surface bounds.
+-----------------------------------------------------------------------------*/
+
+// x64 port: world-space bounds of each BSP surface, whole and unclipped, for
+// FSurfaceFacet::Bounds. The polys handed to a render device are clipped to
+// the view, so a device that needs a surface's REAL extent (OpenGLDrv sizes
+// fountain particle emitters from it) cannot recover it from them. Built in
+// one pass over the nodes on first use per model and cached: a level load
+// costs one scan, every later frame costs an array index.
+static UModel*       GSurfBoundsModel = NULL;
+static TArray<FBox>  GSurfBounds;
+static INT           GSurfBoundsNodes = -1, GSurfBoundsPoints = -1;
+
+static FBox GetSurfBounds( UModel* Model, INT iSurf )
+{
+	guard(GetSurfBounds);
+	// Rebuild when the model changes identity or shape -- the editor rebuilds
+	// geometry under us, and stale bounds would misplace anything derived
+	// from them.
+	if( Model!=GSurfBoundsModel
+	 || GSurfBounds.Num()!=Model->Surfs->Num()
+	 || GSurfBoundsNodes!=Model->Nodes->Num()
+	 || GSurfBoundsPoints!=Model->Points->Num() )
+	{
+		GSurfBoundsModel  = Model;
+		GSurfBoundsNodes  = Model->Nodes->Num();
+		GSurfBoundsPoints = Model->Points->Num();
+		GSurfBounds.Empty();
+		GSurfBounds.Add( Model->Surfs->Num() );
+		for( INT i=0; i<GSurfBounds.Num(); i++ )
+			GSurfBounds(i) = FBox(0);	// invalid until a node contributes
+		for( INT n=0; n<Model->Nodes->Num(); n++ )
+		{
+			FBspNode& Node = Model->Nodes->Element(n);
+			if( Node.NumVertices<3 || Node.iSurf<0 || Node.iSurf>=GSurfBounds.Num() )
+				continue;
+			FBox& B = GSurfBounds(Node.iSurf);
+			for( INT v=0; v<Node.NumVertices; v++ )
+				B += Model->Points->Element( Model->Verts->Element(Node.iVertPool+v).pVertex );
+		}
+	}
+	return GSurfBounds.IsValidIndex(iSurf) ? GSurfBounds(iSurf) : FBox(0);
+	unguard;
+}
+
 void URender::OccludeFrame( FSceneNode* Frame )
 {
 	guard(URender::DrawLevel);
@@ -2781,6 +2827,7 @@ void URender::DrawFrame( FSceneNode* Frame )
 			FSurfaceFacet Facet;
 			Facet.Polys = Draw->Polys;
 			Facet.Span = &Draw->Span;
+			Facet.Bounds = GetSurfBounds( Model, Draw->iSurf );
 			Facet.MapCoords = FCoords
 			(
 				Model->Points->Element (Surf->pBase),

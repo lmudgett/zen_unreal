@@ -150,6 +150,23 @@ class DLL_EXPORT UOpenGLRenderDevice : public URenderDevice
 	GLint			WavyLocFlowV, WavyLocScroll, WavyLocBlob, WavyLocFoam;
 	UBOOL			WavyTried;
 
+	// Fountain columns (see DrawComplexSurface). A pour is authored as several
+	// translucent sheets -- crossed, or the four walls of a box -- and the
+	// particles must fill the whole VOLUME those faces bound, not sit in the
+	// plane of whichever face happened to draw first. So faces accumulate a
+	// world-space box per column (world, not eye: it must survive camera
+	// motion across frames), and the pour draws once per column per frame.
+	enum {MAX_STREAM_COLS=64};
+	struct FStreamColumn
+	{
+		FVector		WMin, WMax;		// world bounds of all faces seen so far
+		INT			Stamp;			// frame stamp of the last draw
+		void*		StampFrame;		// scene node of that draw (mirrors redraw)
+	};
+	FStreamColumn	StreamCols[MAX_STREAM_COLS];
+	INT				NumStreamCols;
+	INT				FrameStamp;
+
 	// Underwater full-screen distortion (see InitUnderwaterProgram / EndFlash).
 	GLuint			UnderwaterProgram;
 	GLint			UWLocTime, UWLocAmp, UWLocPx;
@@ -423,6 +440,8 @@ UOpenGLRenderDevice::UOpenGLRenderDevice()
 	WavyLocBlob      = -1;
 	WavyLocFoam      = -1;
 	WavyTried        = 0;
+	NumStreamCols    = 0;
+	FrameStamp       = 0;
 	UnderwaterProgram= 0;
 	UWLocTime        = -1;
 	UWLocAmp         = -1;
@@ -694,6 +713,7 @@ void UOpenGLRenderDevice::Lock( FPlane InFlashScale, FPlane InFlashFog, FPlane S
 	CurrentFrame = NULL;
 	CurrentBlendFlags = (DWORD)-1;
 	SurfCount = PolyCount = TileCount = DetailCount = 0;
+	FrameStamp++;	// fountain columns draw once per stamp (their boxes persist)
 
 	// Editor hit testing: arm the proxy-stack recorder for this frame.
 	HitDataPtr   = HitData;
@@ -1502,6 +1522,12 @@ void UOpenGLRenderDevice::InitUnderwaterProgram()
 	unguard;
 }
 
+static inline FLOAT ZSmooth( FLOAT A, FLOAT B, FLOAT X )
+{
+	X = Clamp( (X-A)/(B-A), 0.f, 1.f );
+	return X*X*(3.f-2.f*X);
+}
+
 void UOpenGLRenderDevice::DrawComplexSurface( FSceneNode* Frame, FSurfaceInfo& Surface, FSurfaceFacet& Facet )
 {
 	guard(UOpenGLRenderDevice::DrawComplexSurface);
@@ -1553,6 +1579,62 @@ void UOpenGLRenderDevice::DrawComplexSurface( FSceneNode* Frame, FSurfaceInfo& S
 		if( !WavyFlags && !Flowing && !FoldLight )
 			Wavy = 0;	// lit-translucent was the only reason, and it needs multitexture
 
+		// Fountain columns: mappers author a pour as several translucent
+		// sheets -- crossed, or the four walls of a box -- so no per-face
+		// treatment can avoid reading as a glass block, and particles put in
+		// ONE face's plane pour down the side of the column instead of
+		// through it. Each such face therefore only contributes its bounds to
+		// a world-space column box (see StreamCols) and never draws itself;
+		// one face per column per frame draws the whole pour, filling the
+		// accumulated volume. Resolved before any GL binding so the other
+		// faces can skip the draw entirely.
+		UBOOL StreamLook = 0;
+		FStreamColumn* Col = NULL;
+		if( FoldLight && !WavyFlags && !Flowing && Facet.Bounds.IsValid )
+		{
+			// The surface's TRUE world bounds (see FSurfaceFacet::Bounds).
+			// Never the clipped polys: those describe only the part of the
+			// sheet currently on screen, so the emitter volume shrank -- and
+			// the pour vanished -- as the fountain left frame.
+			FVector WMin = Facet.Bounds.Min, WMax = Facet.Bounds.Max;
+			// A pour is narrow in BOTH horizontal axes and tall. That rules
+			// out pool surfaces (both axes large) and lit glass or force-field
+			// walls (thin one way, wide the other), view-independently.
+			FLOAT HX = WMax.X-WMin.X, HY = WMax.Y-WMin.Y;
+			if( Max( HX, HY ) <= 96.f && (WMax.Z-WMin.Z) > 0.f )
+			{
+				StreamLook = 1;
+				FVector FC = (WMin+WMax)*0.5f;
+				for( INT c=0; c<NumStreamCols; c++ )
+				{
+					FStreamColumn& E = StreamCols[c];
+					if( FC.X > E.WMin.X-48.f && FC.X < E.WMax.X+48.f
+					 && FC.Y > E.WMin.Y-48.f && FC.Y < E.WMax.Y+48.f
+					 && FC.Z > E.WMin.Z-48.f && FC.Z < E.WMax.Z+48.f )
+						{ Col = &E; break; }
+				}
+				if( !Col && NumStreamCols < MAX_STREAM_COLS )
+				{
+					Col = &StreamCols[NumStreamCols++];
+					Col->WMin = WMin;
+					Col->WMax = WMax;
+					Col->Stamp = -1;
+					Col->StampFrame = NULL;
+				}
+				if( Col )
+				{
+					Col->WMin.X = Min( Col->WMin.X, WMin.X ); Col->WMax.X = Max( Col->WMax.X, WMax.X );
+					Col->WMin.Y = Min( Col->WMin.Y, WMin.Y ); Col->WMax.Y = Max( Col->WMax.Y, WMax.Y );
+					Col->WMin.Z = Min( Col->WMin.Z, WMin.Z ); Col->WMax.Z = Max( Col->WMax.Z, WMax.Z );
+					if( Col->Stamp==FrameStamp && Col->StampFrame==(void*)Frame )
+						return;		// this column's pour is already drawn this frame
+					Col->Stamp = FrameStamp;
+					Col->StampFrame = (void*)Frame;
+				}
+				else StreamLook = 0;	// registry full: draw the sheet as-is
+			}
+		}
+
 		SetTexture( *Surface.Texture, Surface.PolyFlags, 0 );
 		FLOAT BaseUM = UMult, BaseVM = VMult;
 		FLOAT LightUM = 0.f, LightVM = 0.f;
@@ -1592,8 +1674,8 @@ void UOpenGLRenderDevice::DrawComplexSurface( FSceneNode* Frame, FSurfaceInfo& S
 			ZglUniform1f( WavyLocGloss, WaterFX ? 0.22f : 0.15f );
 			ZglUniform1f( WavyLocBase,  WaterFX ? 0.88f : 1.f );
 			ZglUniform1f( WavyLocLightOn, FoldLight ? 1.f : 0.f );
-			// No stream shaping: the shader's sheet and droplet profiles stay
-			// off unless a caller asks for them.
+			// Ordinary surfaces: no stream shaping. (The fountain path sets
+			// its own uniforms right before drawing, below.)
 			ZglUniform2f( WavyLocUEdge, 0.f, 0.f );
 			ZglUniform2f( WavyLocVEdge, 0.f, 0.f );
 			ZglUniform1f( WavyLocFlowV, 1.f );
@@ -1602,23 +1684,355 @@ void UOpenGLRenderDevice::DrawComplexSurface( FSceneNode* Frame, FSurfaceInfo& S
 			ZglUniform1f( WavyLocFoam, 0.f );
 		}
 		glColor3f( 1.f, 1.f, 1.f );
-		for( FSavedPoly* Poly=Facet.Polys; Poly; Poly=Poly->Next )
+		if( StreamLook && Col )
 		{
-			glBegin( GL_TRIANGLE_FAN );
-			for( INT i=0; i<Poly->NumPts; i++ )
+			// Fountain PARTICLES. The authored sheets are only an emitter
+			// VOLUME (Col's accumulated world box); what draws is a
+			// procedural pour filling that volume's full cross-section --
+			// camera-facing soft droplets falling at ~350 uu/s under
+			// gravity, spreading as they go, fading in at the spout and out
+			// at the water. Positions are pure functions of level time: no
+			// state, so saves, demos and paused frames are consistent.
+			// (OldUnreal 227 replaced these fountains with emitters in
+			// CONTENT; doing it in the driver covers stock maps untouched.)
+			FVector WC   = (Col->WMin + Col->WMax)*0.5f;
+			FVector WExt = (Col->WMax - Col->WMin)*0.5f;	// world half-extents
+
+			// Fall along the zone's GRAVITY, not an assumed world -Z, and
+			// build an orthonormal frame around it: droplets then travel the
+			// way everything else in the zone falls (low-grav zones and
+			// custom ZoneGravity included).
+			FVector GDir( 0, 0, -1 );
+			if( Frame->Level && Frame->Level->Model && Frame->Level->GetLevelInfo() )
 			{
-				FVector& P = Poly->Pts[i]->Point;
-				FLOAT U = Facet.MapCoords.XAxis | (P - Facet.MapCoords.Origin);
-				FLOAT V = Facet.MapCoords.YAxis | (P - Facet.MapCoords.Origin);
+				AZoneInfo* GZone = Frame->Level->Model->PointRegion( Frame->Level->GetLevelInfo(), WC ).Zone;
+				if( GZone )
+				{
+					FLOAT GS = GZone->ZoneGravity.Size();
+					if( GS > 0.001f )
+						GDir = GZone->ZoneGravity/GS;
+				}
+			}
+			FVector Helper = ( Abs(GDir.Z) < 0.9f ) ? FVector(0,0,1) : FVector(1,0,0);
+			FVector S1 = GDir ^ Helper;
+			FLOAT S1S = S1.Size();
+			S1 = S1S>0.001f ? S1/S1S : FVector(1,0,0);
+			FVector S2 = GDir ^ S1;
+			// Box extents resolved onto that frame.
+			FLOAT ExtA = Abs(GDir.X)*WExt.X + Abs(GDir.Y)*WExt.Y + Abs(GDir.Z)*WExt.Z;
+			FLOAT Rad1 = Max( Abs(S1.X)*WExt.X + Abs(S1.Y)*WExt.Y + Abs(S1.Z)*WExt.Z, 1.f );
+			FLOAT Rad2 = Max( Abs(S2.X)*WExt.X + Abs(S2.Y)*WExt.Y + Abs(S2.Z)*WExt.Z, 1.f );
+			FLOAT Height = 2.f*ExtA;
+			// Droplet size follows the column's VISIBLE width, not its
+			// thinnest axis: these volumes are often thin slabs (the Ceremony
+			// fountain is 12x4 units), and sizing off the 4 would draw
+			// two-pixel specks.
+			FLOAT RadRef = Max( Max( Rad1, Rad2 ), 1.f );
+			FLOAT RadMin = Max( Min( Rad1, Rad2 ), 1.f );
+			FVector Spout = WC - GDir*ExtA;		// where the pour starts
+			// Squat volumes are the SPLASH where a pour lands, not the pour.
+			UBOOL Splash = ExtA < 1.2f*Max( Rad1, Rad2 );
+			// Gravity in eye space: droplets are stretched along it so they
+			// read as streaking downward rather than hanging as round dots.
+			FVector GEyeDir = GDir.TransformVectorBy( Frame->Coords );
+
+			// Every droplet samples the same small window of the animated
+			// waterfall texture (drifting for variety); the shader's Blob
+			// profile rounds it into a droplet. Motion replaces warp/scroll.
+			FLOAT TexU = (FLOAT)Surface.Texture->USize, TexV = (FLOAT)Surface.Texture->VSize;
+			FLOAT WinU = Min( 28.f, TexU ), WinV = Min( 28.f, TexV );
+			FLOAT W0u = (FLOAT)fmod( T*11.0, (DOUBLE)Max( 1.f, TexU-WinU ) );
+			FLOAT W0v = (FLOAT)fmod( T* 7.0, (DOUBLE)Max( 1.f, TexV-WinV ) );
+			FLOAT SU0 = W0u*BaseUM, SU1 = (W0u+WinU)*BaseUM;
+			FLOAT SV0 = W0v*BaseVM, SV1 = (W0v+WinV)*BaseVM;
+			ZglUniform2f( WavyLocUEdge, SU0, SU1 );
+			ZglUniform2f( WavyLocVEdge, SV0, SV1 );
+			ZglUniform1f( WavyLocBlob, 1.f );
+			ZglUniform1f( WavyLocAmp, 0.f );
+			ZglUniform1f( WavyLocScroll, 0.f );
+			ZglUniform1f( WavyLocGloss, 0.f );
+
+			// Dense enough that droplets OVERLAP near the spout (a coherent
+			// pour) and separate into droplets as the spread grows.
+			// Legible count, NOT maximum density: hundreds of overlapping
+			// random droplets are statistically stationary -- every frame
+			// looks the same (measured frame-to-frame r=0.98), so the pour
+			// reads as fixed static however fast the droplets really move.
+			// Water reads as falling when the eye can follow individual
+			// strands, so draw fewer, longer, brighter ones.
+			INT K = Splash ? 140 : Clamp( (INT)(Height/2.2f) + 40, 60, 160 );
+			// -probefountainoff draws nothing for these columns: whatever is
+			// still on screen at a fountain is then some OTHER primitive.
+			static UBOOL FountOff = ParseParam( appCmdLine(), "PROBEFOUNTAINOFF" );
+			if( FountOff )
+				K = 0;
+			FLOAT FallTime = Splash ? 0.55f : Max( 0.15f, Height/350.f );
+			FLOAT Phase = (FLOAT)( fmod( T, (DOUBLE)FallTime ) / FallTime );
+			// -probefountain: is the pour actually advancing? (T frozen or a
+			// degenerate box both read on screen as "animated but static".)
+			static UBOOL FountDbg = ParseParam( appCmdLine(), "PROBEFOUNTAIN" );
+			if( FountDbg )
+			{
+				static INT FountEvery = 0;
+				if( ((FountEvery++) % 4)==0 && !Splash )
+				{
+					// Particle 0's phase and world Z: if these do not move,
+					// the pour is frozen no matter what the shader does.
+					DWORD hk0 = 0*2654435761u; DWORD h10 = hk0 ^ (hk0>>15);
+					FLOAT H10 = (h10 & 0xFFFFu)/65536.f;
+					FLOAT S0 = H10 + Phase; S0 -= appFloor(S0);
+					FLOAT F0 = S0*S0*0.75f + S0*0.25f;
+					debugf( "FOUNTAIN: T=%.4f phase=%.4f p0.S=%.4f p0.Z=%.2f height=%.1f K=%i box=(%.0f,%.0f,%.0f)..(%.0f,%.0f,%.0f)",
+						T, Phase, S0, Spout.Z + GDir.Z*(F0*Height), Height, K,
+						Col->WMin.X, Col->WMin.Y, Col->WMin.Z, Col->WMax.X, Col->WMax.Y, Col->WMax.Z );
+				}
+			}
+			glBegin( GL_QUADS );
+			for( INT k=0; k<K; k++ )
+			{
+				// Per-droplet constants: spawn phase, lateral offsets, size.
+				// SCATTERED hashes, not a low-discrepancy ladder: with evenly
+				// spaced phases each droplet is replaced by its neighbour at
+				// the very position it vacated, so the pattern is invariant
+				// under time and the pour shimmers in place instead of
+				// visibly flowing (measured: frame-to-frame r=0.98 at zero
+				// displacement). Irregular phases let the eye lock onto
+				// individual droplets and read the motion.
+				DWORD hk = (DWORD)k*2654435761u;
+				DWORD h1 = hk ^ (hk>>15);
+				DWORD h2 = (hk*1103515245u+12345u); h2 ^= h2>>16;
+				DWORD h3 = (hk*22695477u+1u);       h3 ^= h3>>13;
+				FLOAT H1 = (h1 & 0xFFFFu)/65536.f;
+				FLOAT H2 = (h2 & 0xFFFFu)/65536.f;
+				FLOAT H3 = (h3 & 0xFFFFu)/65536.f;
+				// Each droplet advances a FULL travel per cycle, carrying its
+				// own offsets and size with it.
+				FLOAT S  = H1 + Phase;
+				S -= appFloor(S);
+				FVector Pw;
+				FLOAT R, A, Stretch;
+				if( Splash )
+				{
+					// Low wide spray at the waterline, thrown outward and
+					// arcing back down along gravity.
+					FLOAT Rise = 4.f*S*(1.f-S);
+					FLOAT G = 0.25f + 2.2f*S;
+					Pw = WC - GDir*( Rise*RadMin*0.55f )
+					   + S1*((H2*2.f-1.f)*Rad1*G)
+					   + S2*((H3*2.f-1.f)*Rad2*G);
+					R = RadRef*( 0.10f + 0.10f*H3 );
+					A = ZSmooth( 0.f, 0.12f, S )*( 1.f-ZSmooth( 0.35f, 1.f, S ) )*( 0.22f + 0.22f*H2 );
+					Stretch = 1.f;	// spray flies every which way: keep it round
+				}
+				else
+				{
+					// Accelerating fall: droplets bunch at the spout and
+					// streak apart lower down. Spawn across the WHOLE
+					// cross-section of the column, drifting outward as they
+					// fall (never just the plane of one authored face).
+					FLOAT Fall = S*S*0.75f + S*0.25f;
+					FLOAT G = 0.55f + 0.5f*Fall;	// fraction of the cross-section
+					Pw = Spout + GDir*(Fall*Height)
+					   + S1*((H2*2.f-1.f)*Rad1*G)
+					   + S2*((H3*2.f-1.f)*Rad2*G);
+					R = RadRef*( 0.08f + 0.06f*H3 );
+					// Visible right down to the surface, so a droplet is
+					// touching the water when its ripple is born.
+					A = ZSmooth( 0.f, 0.06f, S )*( 1.f-ZSmooth( 0.97f, 1.f, S ) )*( 0.55f + 0.35f*H2 );
+					// Motion streak, stretched further the faster it falls.
+					// Kept SHORT relative to the drop: streaks spanning a
+					// large part of the column overlap into a union that
+					// barely changes as they move, so the pour looks frozen
+					// however fast the strands travel.
+					Stretch = 3.f + 3.f*Fall;
+				}
+				glColor3f( A, A, A );
+				FVector Pp = Pw.TransformPointBy( Frame->Coords );	// world -> eye
+				if( Pp.Z < 1.f )
+					continue;	// behind/at the eye: nothing sane to draw
 				if( FoldLight )
+				{
+					FLOAT LU = Facet.MapCoords.XAxis | (Pp - Facet.MapCoords.Origin);
+					FLOAT LV = Facet.MapCoords.YAxis | (Pp - Facet.MapCoords.Origin);
 					ZglMultiTexCoord2f( GL_TEXTURE1,
-						(U-Surface.LightMap->Pan.X+0.5f*Surface.LightMap->UScale)*LightUM,
-						(V-Surface.LightMap->Pan.Y+0.5f*Surface.LightMap->VScale)*LightVM );
-				glTexCoord2f( (U-Surface.Texture->Pan.X)*BaseUM, (V-Surface.Texture->Pan.Y)*BaseVM );
-				glVertex3f( P.X, P.Y, P.Z );
+						(LU-Surface.LightMap->Pan.X+0.5f*Surface.LightMap->UScale)*LightUM,
+						(LV-Surface.LightMap->Pan.Y+0.5f*Surface.LightMap->VScale)*LightVM );
+				}
+				// Camera-facing quad, its long axis along gravity AS SEEN ON
+				// SCREEN: the perspective-correct direction of a world vector
+				// at this depth is its eye-space XY minus the radial part.
+				// (Falls back to screen-vertical when gravity points at the
+				// camera, where a streak has no direction anyway.)
+				FLOAT DX = GEyeDir.X - GEyeDir.Z*Pp.X/Pp.Z;
+				FLOAT DY = GEyeDir.Y - GEyeDir.Z*Pp.Y/Pp.Z;
+				FLOAT DL = appSqrt( DX*DX + DY*DY );
+				if( DL > 0.001f ) { DX /= DL; DY /= DL; }
+				else              { DX = 0.f;  DY = 1.f; }
+				FLOAT LX = DX*R*Stretch, LY = DY*R*Stretch;	// along the fall
+				FLOAT WX = -DY*R,        WY = DX*R;			// across it
+				glTexCoord2f( SU0, SV0 ); glVertex3f( Pp.X-LX-WX, Pp.Y-LY-WY, Pp.Z );
+				glTexCoord2f( SU1, SV0 ); glVertex3f( Pp.X-LX+WX, Pp.Y-LY+WY, Pp.Z );
+				glTexCoord2f( SU1, SV1 ); glVertex3f( Pp.X+LX+WX, Pp.Y+LY+WY, Pp.Z );
+				glTexCoord2f( SU0, SV1 ); glVertex3f( Pp.X+LX-WX, Pp.Y+LY-WY, Pp.Z );
 			}
 			glEnd();
 			PolyCount++;
+
+			// Where the pour lands: FOAM and RIPPLES on the pool surface.
+			// Only when the column really ends in water (a pour onto stone
+			// must not grow rings), and drawn FLAT in the water plane rather
+			// than camera-facing, so they read as marks on the surface from
+			// any angle.
+			UBOOL Lands = 0;
+			if( !Splash && Frame->Level && Frame->Level->Model && Frame->Level->GetLevelInfo() )
+			{
+				FVector Below = WC;
+				Below.Z = Col->WMin.Z - 4.f;	// just under the waterline
+				AZoneInfo* BZone = Frame->Level->Model->PointRegion( Frame->Level->GetLevelInfo(), Below ).Zone;
+				Lands = BZone && BZone->bWaterZone;
+			}
+			if( Lands )
+			{
+				// Put the marks on the WATERLINE. Sheets usually end there,
+				// but some are built poking into the pool, so walk up out of
+				// the water zone to find the surface rather than trusting the
+				// sheet's bottom.
+				FLOAT SurfZ = Col->WMin.Z + 1.f;
+				{
+					FVector Probe = WC;
+					for( INT st=0; st<8; st++ )
+					{
+						Probe.Z = Col->WMin.Z + st*4.f;
+						AZoneInfo* PZone = Frame->Level->Model->PointRegion( Frame->Level->GetLevelInfo(), Probe ).Zone;
+						if( !PZone || !PZone->bWaterZone )
+							{ SurfZ = Probe.Z; break; }
+					}
+				}
+
+				// Ripples: concentric rings expanding from the impact and
+				// fading as they widen. Each ring is a strip of segments; the
+				// shader's band profile softens them across their width, and
+				// the texture coordinate runs along the circumference so no
+				// two rings look alike.
+				ZglUniform1f( WavyLocBlob, 2.f );
+				ZglUniform1f( WavyLocFoam, 0.45f );
+				ZglUniform1f( WavyLocFlowV, 1.f );		// 's' spans the ring width
+				ZglUniform2f( WavyLocUEdge, SU0, SU1 );
+				ZglUniform2f( WavyLocVEdge, SV0, SV1 );
+				// Ring births are PHASE-LOCKED to the pour: one ring per fall
+				// cycle, so a ring starts at the instant the falling water
+				// arrives rather than on a clock of its own (which looks like
+				// a surface rippling for no reason). Each ring then lives
+				// NRings cycles, so NRings are alive, evenly staggered.
+				const INT   NRings = 4, NSeg = 28;
+				FLOAT RingTime = FallTime*NRings;
+				FLOAT RingPh = (FLOAT)( fmod( T, (DOUBLE)RingTime ) / RingTime );
+				glBegin( GL_QUADS );
+				for( INT r=0; r<NRings; r++ )
+				{
+					FLOAT Sr = (FLOAT)r/(FLOAT)NRings + RingPh;
+					Sr -= appFloor(Sr);
+					FLOAT Rr = RadRef*( 0.8f + 7.5f*Sr );			// expanding
+					FLOAT Wr = RadRef*( 0.35f + 0.45f*Sr );			// widening
+					FLOAT Ar = ZSmooth( 0.f, 0.10f, Sr )*( 1.f-ZSmooth( 0.15f, 1.f, Sr ) )*0.5f;
+					if( Ar <= 0.002f )
+						continue;
+					glColor3f( Ar, Ar, Ar );
+					for( INT s=0; s<NSeg; s++ )
+					{
+						FLOAT A0 = (2.f*PI*s)/NSeg, A1 = (2.f*PI*(s+1))/NSeg;
+						FLOAT C0 = appCos(A0), N0 = appSin(A0);
+						FLOAT C1 = appCos(A1), N1 = appSin(A1);
+						// Sample a different strip of the texture per segment
+						// so the ring is not a perfectly even band.
+						FLOAT T0 = SV0 + (SV1-SV0)*((FLOAT)s/NSeg);
+						FLOAT T1 = SV0 + (SV1-SV0)*((FLOAT)(s+1)/NSeg);
+						FVector Q0( WC.X + C0*(Rr-Wr), WC.Y + N0*(Rr-Wr), SurfZ );
+						FVector Q1( WC.X + C0*(Rr+Wr), WC.Y + N0*(Rr+Wr), SurfZ );
+						FVector Q2( WC.X + C1*(Rr+Wr), WC.Y + N1*(Rr+Wr), SurfZ );
+						FVector Q3( WC.X + C1*(Rr-Wr), WC.Y + N1*(Rr-Wr), SurfZ );
+						FVector E0 = Q0.TransformPointBy( Frame->Coords );
+						FVector E1 = Q1.TransformPointBy( Frame->Coords );
+						FVector E2 = Q2.TransformPointBy( Frame->Coords );
+						FVector E3 = Q3.TransformPointBy( Frame->Coords );
+						if( E0.Z<1.f || E1.Z<1.f || E2.Z<1.f || E3.Z<1.f )
+							continue;
+						glTexCoord2f( SU0, T0 ); glVertex3f( E0.X, E0.Y, E0.Z );
+						glTexCoord2f( SU1, T0 ); glVertex3f( E1.X, E1.Y, E1.Z );
+						glTexCoord2f( SU1, T1 ); glVertex3f( E2.X, E2.Y, E2.Z );
+						glTexCoord2f( SU0, T1 ); glVertex3f( E3.X, E3.Y, E3.Z );
+					}
+				}
+				glEnd();
+				PolyCount++;
+
+				// Froth: aerated white puffs churning at the impact point,
+				// drifting outward and dissolving. Flat on the surface too.
+				ZglUniform1f( WavyLocBlob, 1.f );
+				ZglUniform1f( WavyLocFoam, 1.f );
+				// Froth churns on the same arrival cadence.
+				const INT   NFoam = 54;
+				FLOAT FoamTime = Max( 0.35f, FallTime );
+				FLOAT FoamPh = (FLOAT)( fmod( T, (DOUBLE)FoamTime ) / FoamTime );
+				glBegin( GL_QUADS );
+				for( INT m=0; m<NFoam; m++ )
+				{
+					DWORD hm = (DWORD)(m+11)*2246822519u;
+					DWORD g1 = hm ^ (hm>>13);
+					DWORD g2 = (hm*3266489917u+374761393u); g2 ^= g2>>15;
+					DWORD g3 = (hm*668265263u+1u);          g3 ^= g3>>17;
+					FLOAT G1 = (g1 & 0xFFFFu)/65536.f;
+					FLOAT G2 = (g2 & 0xFFFFu)/65536.f;
+					FLOAT G3 = (g3 & 0xFFFFu)/65536.f;
+					FLOAT Sf = G1 + FoamPh;
+					Sf -= appFloor(Sf);
+					FLOAT Ang = G2*2.f*PI + 0.9f*Sf;			// swirls as it spreads
+					FLOAT Rad = RadRef*( 0.15f + 2.3f*Sf*(0.5f+0.5f*G3) );
+					FLOAT Rf  = RadRef*( 0.30f + 0.26f*G3 )*( 0.8f + 0.5f*Sf );
+					FLOAT Af  = ZSmooth( 0.f, 0.10f, Sf )*( 1.f-ZSmooth( 0.30f, 1.f, Sf ) )*( 0.34f + 0.28f*G2 );
+					if( Af <= 0.002f )
+						continue;
+					FLOAT FX = WC.X + appCos(Ang)*Rad, FY = WC.Y + appSin(Ang)*Rad;
+					FVector P0( FX-Rf, FY-Rf, SurfZ ), P1( FX+Rf, FY-Rf, SurfZ );
+					FVector P2( FX+Rf, FY+Rf, SurfZ ), P3( FX-Rf, FY+Rf, SurfZ );
+					FVector E0 = P0.TransformPointBy( Frame->Coords );
+					FVector E1 = P1.TransformPointBy( Frame->Coords );
+					FVector E2 = P2.TransformPointBy( Frame->Coords );
+					FVector E3 = P3.TransformPointBy( Frame->Coords );
+					if( E0.Z<1.f || E1.Z<1.f || E2.Z<1.f || E3.Z<1.f )
+						continue;
+					glColor3f( Af, Af, Af );
+					glTexCoord2f( SU0, SV0 ); glVertex3f( E0.X, E0.Y, E0.Z );
+					glTexCoord2f( SU1, SV0 ); glVertex3f( E1.X, E1.Y, E1.Z );
+					glTexCoord2f( SU1, SV1 ); glVertex3f( E2.X, E2.Y, E2.Z );
+					glTexCoord2f( SU0, SV1 ); glVertex3f( E3.X, E3.Y, E3.Z );
+				}
+				glEnd();
+				PolyCount++;
+				ZglUniform1f( WavyLocFoam, 0.f );
+			}
+			glColor3f( 1.f, 1.f, 1.f );
+		}
+		else
+		{
+			for( FSavedPoly* Poly=Facet.Polys; Poly; Poly=Poly->Next )
+			{
+				glBegin( GL_TRIANGLE_FAN );
+				for( INT i=0; i<Poly->NumPts; i++ )
+				{
+					FVector& P = Poly->Pts[i]->Point;
+					FLOAT U = Facet.MapCoords.XAxis | (P - Facet.MapCoords.Origin);
+					FLOAT V = Facet.MapCoords.YAxis | (P - Facet.MapCoords.Origin);
+					if( FoldLight )
+						ZglMultiTexCoord2f( GL_TEXTURE1,
+							(U-Surface.LightMap->Pan.X+0.5f*Surface.LightMap->UScale)*LightUM,
+							(V-Surface.LightMap->Pan.Y+0.5f*Surface.LightMap->VScale)*LightVM );
+					glTexCoord2f( (U-Surface.Texture->Pan.X)*BaseUM, (V-Surface.Texture->Pan.Y)*BaseVM );
+					glVertex3f( P.X, P.Y, P.Z );
+				}
+				glEnd();
+				PolyCount++;
+			}
 		}
 		if( Wavy )
 			ZglUseProgram( 0 );

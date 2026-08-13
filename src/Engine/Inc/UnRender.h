@@ -333,6 +333,13 @@ struct FSurfaceFacet
 	FCoords			MapUncoords;	// Inverse mapping coordinates.
 	FSpanBuffer*	Span;			// Span buffer, if rendering device wants it.
 	FSavedPoly*		Polys;			// Polygon list.
+	// x64 port: world-space bounds of the WHOLE surface, unclipped (IsValid=0
+	// when the renderer did not supply them). Polys above are clipped to the
+	// view, so they describe only the visible part of a surface -- fine for
+	// drawing it, useless for anything that must know the surface's real
+	// extent (OpenGLDrv derives fountain emitter volumes from these: with
+	// clipped polys the pour shrank, and vanished, as the sheet left frame).
+	FBox			Bounds;
 };
 
 /*------------------------------------------------------------------------------------
