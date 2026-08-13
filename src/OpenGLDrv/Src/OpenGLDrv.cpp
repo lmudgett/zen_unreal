@@ -141,6 +141,7 @@ class DLL_EXPORT UOpenGLRenderDevice : public URenderDevice
 	FCachedTexture*	BindMap[CACHE_BUCKETS];
 	QWORD			CurrentTextureID;
 	FLOAT			UMult, VMult;
+	UBOOL			TileDraw;	// inside DrawTile: translucent binds go mip-0-only (see SetTexture)
 
 	// Frame state.
 	FPlane			FlashScale;
@@ -248,7 +249,7 @@ class DLL_EXPORT UOpenGLRenderDevice : public URenderDevice
 	void SetSceneNode( FSceneNode* Frame );
 	void SetBlend( DWORD PolyFlags );
 	void SetTexture( FTextureInfo& Info, DWORD PolyFlags, UBOOL Clamp );
-	void UploadTexture( FTextureInfo& Info, DWORD PolyFlags );
+	void UploadTexture( FTextureInfo& Info, DWORD PolyFlags, UBOOL SpriteTile );
 	FLOAT EyeX( FSceneNode* Frame, FLOAT ScreenX, FLOAT Z ) { return (ScreenX - Frame->FX2) * Z / Frame->Proj.Z; }
 	FLOAT EyeY( FSceneNode* Frame, FLOAT ScreenY, FLOAT Z ) { return (ScreenY - Frame->FY2) * Z / Frame->Proj.Z; }
 };
@@ -279,6 +280,7 @@ UOpenGLRenderDevice::UOpenGLRenderDevice()
 	CurrentTextureID = 0;
 	CurrentFrame     = NULL;
 	CurrentBlendFlags= (DWORD)-1;
+	TileDraw         = 0;
 	appMemset( BindMap, 0, sizeof(BindMap) );
 	AppliedGamma     = -1.f;
 	for( INT i=0; i<256; i++ ) GammaLUT[i] = (BYTE)i;	// identity until first UpdateGamma
@@ -816,6 +818,29 @@ void UOpenGLRenderDevice::SetTexture( FTextureInfo& Info, DWORD PolyFlags, UBOOL
 	// filter its first draw requested).
 	if( PolyFlags & PF_NoSmooth )
 		TestID |= (QWORD)8;
+	// Translucent uploads gate the near-black dither floor (see UploadTexture),
+	// so they too need their own cache entry.
+	if( (PolyFlags & PF_Translucent) && !(PolyFlags & PF_Modulated) )
+		TestID |= (QWORD)16;
+	// Translucent and modulated WORLD-SPRITE tiles (smoke, fireballs, flame
+	// sprites -- they alone carry PF_TwoSided, added by DrawActorSprite; UI
+	// tiles and coronas don't) get a dedicated upload variant, sampled from
+	// mip 0 only and with a border fade (see UploadTexture). Small mips
+	// concentrate the image's energy into a couple of texels -- at 2x2/4x4 ANY
+	// non-neutral texel bilinear-spreads across the entire tile, so a minified
+	// puff renders as a full-quad square: gray blocks for translucent trails,
+	// and a square tint riding on modulated smoke (the grenade's BlackSmoke
+	// trail). 1998 sprites were never mipmapped: the software renderer point-
+	// sampled mip 0 at every distance, so do the same. Translucent world
+	// SURFACES (water, lava) keep their mip chains -- TileDraw is only set
+	// inside DrawTile. Clamp too: REPEAT wrap bilinear-bleeds the opposite
+	// edge into the quad border.
+	UBOOL SpriteTile = TileDraw && (PolyFlags & (PF_Translucent|PF_Modulated)) && (PolyFlags & PF_TwoSided);
+	if( SpriteTile )
+	{
+		TestID |= (QWORD)32;
+		Clamp = 1;
+	}
 
 	// Find in cache.
 	FCachedTexture** Bucket = &BindMap[ (DWORD)(TestID>>12) & (CACHE_BUCKETS-1) ];
@@ -856,7 +881,7 @@ void UOpenGLRenderDevice::SetTexture( FTextureInfo& Info, DWORD PolyFlags, UBOOL
 	{
 		Info.TextureFlags &= ~TF_RealtimeChanged;
 		DOUBLE U0 = GLStats ? appSeconds() : 0.0;
-		UploadTexture( Info, PolyFlags );
+		UploadTexture( Info, PolyFlags, SpriteTile );
 		if( GLStats )
 		{
 			GLUploadMs += (appSeconds()-U0)*1000.0;
@@ -867,8 +892,8 @@ void UOpenGLRenderDevice::SetTexture( FTextureInfo& Info, DWORD PolyFlags, UBOOL
 		UBOOL Smooth = !(PolyFlags & PF_NoSmooth);
 		glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, Smooth ? GL_LINEAR : GL_NEAREST );
 		glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
-			Info.NumMips>1 ? (Smooth ? GL_LINEAR_MIPMAP_LINEAR : GL_NEAREST_MIPMAP_NEAREST)
-			               : (Smooth ? GL_LINEAR : GL_NEAREST) );
+			(Info.NumMips>1 && !SpriteTile) ? (Smooth ? GL_LINEAR_MIPMAP_LINEAR : GL_NEAREST_MIPMAP_NEAREST)
+			                                : (Smooth ? GL_LINEAR : GL_NEAREST) );
 		glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, Clamp ? GL_CLAMP_TO_EDGE : GL_REPEAT );
 		glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, Clamp ? GL_CLAMP_TO_EDGE : GL_REPEAT );
 		// x64 port: retail GlideDrv sharpened mip selection via grTexLodBiasValue
@@ -882,13 +907,13 @@ void UOpenGLRenderDevice::SetTexture( FTextureInfo& Info, DWORD PolyFlags, UBOOL
 //
 // Convert and upload all mips of a texture.
 //
-void UOpenGLRenderDevice::UploadTexture( FTextureInfo& Info, DWORD PolyFlags )
+void UOpenGLRenderDevice::UploadTexture( FTextureInfo& Info, DWORD PolyFlags, UBOOL SpriteTile )
 {
 	guard(UOpenGLRenderDevice::UploadTexture);
 	FMemMark Mark(GMem);
 	UploadCount++;
 
-	for( INT iMip=0; iMip<Info.NumMips; iMip++ )
+	for( INT iMip=0; iMip<(SpriteTile ? Min(1,Info.NumMips) : Info.NumMips); iMip++ )
 	{
 		FMipmap* Mip = Info.Mips[iMip];
 		if( !Mip )
@@ -926,6 +951,32 @@ void UOpenGLRenderDevice::UploadTexture( FTextureInfo& Info, DWORD PolyFlags )
 				LocalPal[i].A = 255;
 			if( PolyFlags & PF_Masked )
 				LocalPal[0] = FColor(0,0,0,0);
+			// x64 port: gate the near-black dither floor out of translucent
+			// textures. Effect sprites (SmokeGray, explosion frames) carry a
+			// scattered 1..22-value speckle field around the actual puff. Under
+			// ONE / ONE_MINUS_SRC_COLOR every texel adds, and BILINEAR filtering
+			// smears the speckles into a smooth gray field that fills the whole
+			// quad -- dozens of stacked trail puffs then render as bright
+			// straight-edged rectangles (the reported "square overlays"). 1998
+			// never showed this floor: the software renderer POINT-sampled it
+			// into isolated sub-visible dots (DrawTile.cpp adds per-texel with
+			// no filtering), and Glide's dithered 16bpp quantized the +1..3
+			// lifts away entirely. Quadratic gate below L=16: scale=(L/16)^2,
+			// continuous at 16 so smooth dark gradients don't band; texels >=16
+			// (the visible smoke itself, incl. the faint dissipation frames)
+			// are untouched.
+			if( (PolyFlags & PF_Translucent) && !(PolyFlags & PF_Modulated) )
+				for( INT i=0; i<256; i++ )
+				{
+					INT L = Max( (INT)LocalPal[i].R, Max( (INT)LocalPal[i].G, (INT)LocalPal[i].B ) );
+					if( L>0 && L<16 )
+					{
+						INT Num = L*L;	// /256 == (L/16)^2
+						LocalPal[i].R = (BYTE)( (LocalPal[i].R*Num) >> 8 );
+						LocalPal[i].G = (BYTE)( (LocalPal[i].G*Num) >> 8 );
+						LocalPal[i].B = (BYTE)( (LocalPal[i].B*Num) >> 8 );
+					}
+				}
 			INT N = Min( Count, SrcBytes );
 			for( INT i=0; i<N; i++ )
 				Dst[i] = LocalPal[Src[i]];
@@ -947,13 +998,77 @@ void UOpenGLRenderDevice::UploadTexture( FTextureInfo& Info, DWORD PolyFlags )
 
 		// x64 port: bake screen brightness into the texel colors via the gamma LUT
 		// (identity when the slider is at neutral 0.5, so this is a no-op then).
-		if( AppliedGamma<0.49f || AppliedGamma>0.51f )
+		// NOT for modulated sprite tiles: their texels are blend FACTORS
+		// (2*src*dst), not colors -- the background they multiply is already
+		// gamma-baked, so lifting the texels too double-applies brightness.
+		// Worse, the lift moves the texture's neutral-gray surround (127) off
+		// the blend's fixed neutral point, so at any brightness above 0.5 the
+		// whole quad brightened what's behind it -- a straight-edged light
+		// square riding on the grenade's BlackSmoke trail.
+		if( (AppliedGamma<0.49f || AppliedGamma>0.51f)
+		&&	!( SpriteTile && (PolyFlags & PF_Modulated) ) )
 			for( INT i=0; i<Count; i++ )
 			{
 				Dst[i].R = GammaLUT[Dst[i].R];
 				Dst[i].G = GammaLUT[Dst[i].G];
 				Dst[i].B = GammaLUT[Dst[i].B];
 			}
+
+		// x64 port: world-sprite tiles fade their outermost texels to the blend
+		// mode's NEUTRAL value. A quad's edge is only invisible where the
+		// texture reaches the border at exactly that value -- black under
+		// additive translucency, mid-gray (127: 2*src*dst == dst) under
+		// modulation -- and effect sprites don't guarantee it (the late
+		// SmokeGray dissipation frames are a faint speckle field spread to the
+		// tile border), so any off-neutral border content bilinear-smears into
+		// a film that stops dead at the quad edge -- a visible straight line,
+		// so the aging top of a smoke trail "squares off". The 1998 software
+		// renderer got away with border speckles because point sampling drew
+		// them as isolated sub-visible dots. Ramp the outer ~1/8th (max 8
+		// texels) linearly to neutral per axis: content in the tile's core is
+		// untouched, and no quad edge can ever carry a luminance step. RGB
+		// only -- alpha is left alone so masked alpha-testing is unaffected.
+		if( SpriteTile )
+		{
+			FLOAT Neutral = (PolyFlags & PF_Modulated) ? 127.5f : 0.f;
+			// Modulated tiles: the smoke art's "empty" surround is not exactly
+			// neutral (bs2_* sits at 129..131 vs 2*src*dst neutral 127.5), so
+			// the whole quad faintly brightened everything behind it -- on a
+			// bright wall a visible straight-edged tint. Same idea as the
+			// translucent dither-floor gate: pull texels within +-12 of neutral
+			// quadratically onto it (continuous at the band edge), which
+			// flattens the surround to a true no-op while leaving the actual
+			// smoke values (70..110) untouched.
+			if( PolyFlags & PF_Modulated )
+				for( INT i=0; i<Count; i++ )
+				{
+					FColor& C = Dst[i];
+					BYTE* Ch[3] = { &C.R, &C.G, &C.B };
+					for( INT c=0; c<3; c++ )
+					{
+						FLOAT D = (FLOAT)*Ch[c] - 127.5f;
+						FLOAT A = Abs(D);
+						if( A < 12.f )
+							*Ch[c] = (BYTE)( 127.5f + D*(A/12.f)*(A/12.f) );
+					}
+				}
+			INT Fx = Clamp( USize/8, 1, 8 ), Fy = Clamp( VSize/8, 1, 8 );
+			for( INT y=0; y<VSize; y++ )
+			{
+				FLOAT Wy = Min( 1.f, (FLOAT)Min(y+1,VSize-y)/Fy );
+				for( INT x=0; x<USize; x++ )
+				{
+					FLOAT W = Wy * Min( 1.f, (FLOAT)Min(x+1,USize-x)/Fx );
+					if( W < 1.f )
+					{
+						FColor& C = Dst[y*USize+x];
+						C.R = (BYTE)(C.R*W + Neutral*(1.f-W));
+						C.G = (BYTE)(C.G*W + Neutral*(1.f-W));
+						C.B = (BYTE)(C.B*W + Neutral*(1.f-W));
+					}
+				}
+			}
+		}
 
 		glTexImage2D( GL_TEXTURE_2D, iMip, GL_RGBA8, USize, VSize, 0, GL_RGBA, GL_UNSIGNED_BYTE, Dst );
 	}
@@ -1250,12 +1365,38 @@ void UOpenGLRenderDevice::DrawTile( FSceneNode* Frame, FTextureInfo& Info, FLOAT
 		HitTestBox( X, Y, X+XL, Y+YL );
 
 	SetBlend( PolyFlags );
+	TileDraw = 1;
 	SetTexture( Info, PolyFlags, 0 );
+	TileDraw = 0;
 
 	if( PolyFlags & PF_Modulated )
 		glColor3f( 1.f, 1.f, 1.f );
 	else
 		glColor3f( Color.R, Color.G, Color.B );
+
+	// x64 port: a world sprite is a screen-space quad at ONE depth, so a
+	// per-pixel depth test cuts it along a dead-straight isodepth line wherever
+	// it meets a surface. A rocket fireball is a billboard CENTRED on the impact
+	// point, so half of it is geometrically inside the ground it went off
+	// against and the z-test slices the bottom off with a razor edge -- the
+	// reported "square" explosions and smoke. No forward depth offset can fix
+	// that: the floor runs continuously from the sprite all the way back to the
+	// eye, so moving the sprite's plane nearer only slides the cut line, it
+	// never removes it.
+	//
+	// The 1998 software renderer never showed this because sprites were occluded
+	// per-SPAN against the BSP (DrawTile clipped to Sprite->SpanBuffer), not per
+	// pixel -- a fireball resting on the floor drew whole. Hardware span buffers
+	// do not exist here (SpanBased=0, so Span arrives NULL), so match that look
+	// directly: non-occluding translucent/modulated tiles skip the depth TEST.
+	// They still never write depth, and the engine still draws sprites in its
+	// own back-to-front order, so sprite-vs-sprite and sprite-vs-weapon layering
+	// is unchanged. The cost is that an effect can bleed over world geometry
+	// nearer than it -- a flash going off just around a corner. BSP leaf
+	// visibility culls the fully-hidden cases before they ever reach the driver.
+	UBOOL NoDepthTest = (PolyFlags & (PF_Translucent|PF_Modulated)) && !(PolyFlags & PF_Occlude);
+	if( NoDepthTest )
+		glDisable( GL_DEPTH_TEST );
 
 	FLOAT u0=U*UMult, v0=V*VMult, u1=(U+UL)*UMult, v1=(V+VL)*VMult;
 	glBegin( GL_QUADS );
@@ -1264,6 +1405,9 @@ void UOpenGLRenderDevice::DrawTile( FSceneNode* Frame, FTextureInfo& Info, FLOAT
 	glTexCoord2f( u1, v1 ); glVertex3f( EyeX(Frame,X+XL,Z), EyeY(Frame,Y+YL,Z), Z );
 	glTexCoord2f( u0, v1 ); glVertex3f( EyeX(Frame,X,   Z), EyeY(Frame,Y+YL,Z), Z );
 	glEnd();
+
+	if( NoDepthTest )
+		glEnable( GL_DEPTH_TEST );
 	unguard;
 }
 

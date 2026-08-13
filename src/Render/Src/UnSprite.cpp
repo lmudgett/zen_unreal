@@ -185,9 +185,29 @@ UBOOL FDynamicSprite::Setup( FSceneNode* Frame )
 			return 0;
 
 		// Setup projection plane.
-		Z = ((Actor->Location - Frame->Coords.Origin) | Frame->Coords.ZAxis) - SPRITE_PROJECTION_FORWARD;
+		FLOAT ActorZ = ((Actor->Location - Frame->Coords.Origin) | Frame->Coords.ZAxis);
+		Z = ActorZ - SPRITE_PROJECTION_FORWARD;
 		if( Z<-2*SPRITE_PROJECTION_FORWARD && !Frame->Viewport->IsOrtho() )
 			return 0;
+
+		// x64 port: a sprite is a screen-space quad rendered at ONE depth, so on
+		// a z-buffered driver every pixel of it is tested against the same plane.
+		// The fixed 32-unit nudge above only clears geometry for small sprites --
+		// a rocket explosion is ~220 units across, so the wall or floor it went
+		// off against is nearer than that plane over much of the quad and the
+		// depth test cuts the fireball along dead-straight lines (the "square
+		// explosion", and smoke that the surface behind it shows straight
+		// through). Push the plane out to the near face of the sprite's own
+		// bounding sphere instead: the whole quad then clears what the sprite is
+		// touching, while anything genuinely in front of the sphere still
+		// occludes it. Ortho editor views keep the raw value -- Z is not a
+		// perspective depth there.
+		if( !Frame->Viewport->IsOrtho() )
+		{
+			FLOAT Radius  = 0.5f * DrawScale * (FLOAT)Max( Texture->USize, Texture->VSize );
+			FLOAT Forward = Max( (FLOAT)SPRITE_PROJECTION_FORWARD, Radius );
+			Z = Max( ActorZ - Forward, 1.f );
+		}
 
 		// See if this is occluded.
 		if( !GRender->Project( Frame, Actor->Location, ScreenX, ScreenY, &Persp ) )
@@ -742,7 +762,70 @@ void URender::DrawActorSprite( FSceneNode* Frame, FDynamicSprite* Sprite )
 		// off-screen at high resolutions. Same bug class as the corona and
 		// bParticles fixes; no-op at/below 720p.
 		FLOAT UISc = Max( 1.f, (FLOAT)Frame->Y / 720.f );
-		if( Texture ) Frame->Viewport->Canvas->DrawIcon
+		DWORD TileFlags = PolyFlags | PF_TwoSided | Texture->PolyFlags;
+		// x64 port: DrawTile skips the per-pixel depth test for non-occluding
+		// translucent/modulated tiles so billboards centred on an impact point
+		// aren't razor-cut by the surface they went off against (see OpenGLDrv
+		// DrawTile). The cost was that a sprite in a visible BSP leaf drew
+		// straight through nearer walls -- rocket smoke trails stayed in view
+		// through the wall the rocket flew behind. Recover occlusion the way
+		// the coronas do: read back what depth actually got drawn at five
+		// points of the quad and skip the sprite only when every sample sits
+		// behind nearer geometry. Partly hidden sprites still draw whole
+		// (matching the software-span look); depth-tested masked sprites and
+		// devices without depth readback (GetPixelDepth==0) are unaffected.
+		// -probesprite: log the occlusion decision for every translucent world
+		// sprite (repro diagnostic, same family as -probefx).
+		static UBOOL ProbeSprite = ParseParam( appCmdLine(), "probesprite" );
+		UBOOL Occluded = 0;
+		if( !Frame->Viewport->IsOrtho()
+		&&	!Frame->Viewport->RenDev->SpanBased
+		&&	(TileFlags & (PF_Translucent|PF_Modulated))
+		&&	!(TileFlags & PF_Occlude) )
+		{
+			FLOAT ActorZ = (Sprite->Actor->Location - Frame->Coords.Origin) | Frame->Coords.ZAxis;
+			if( ActorZ > 1.f )
+			{
+				static const FLOAT Off[5][2] = { {0.f,0.f}, {-.25f,-.25f}, {.25f,-.25f}, {-.25f,.25f}, {.25f,.25f} };
+				INT Visible = 0, CenterVis = 0;
+				for( INT i=0; i<5; i++ )
+				{
+					FLOAT PixelZ = Frame->Viewport->RenDev->GetPixelDepth
+					(
+						Frame,
+						appFloor( Sprite->ScreenX + Off[i][0]*XScale ),
+						appFloor( Sprite->ScreenY + Off[i][1]*YScale )
+					);
+					if( PixelZ<=0.f || PixelZ >= ActorZ*0.98f )
+					{
+						Visible++;
+						if( i==0 )
+							CenterVis = 1;
+					}
+				}
+				// A quad that survives the test still draws WHOLE (no per-pixel
+				// clip), so any surviving sample lets the sprite bleed over the
+				// wall hiding the rest of it -- a smoke trail behind a doorway
+				// re-appeared through the wall from the quads straddling the
+				// opening. Fade translucent sprites by the visible fraction
+				// instead: fully hidden = skipped, mostly hidden = faint fringe
+				// at the opening, fully visible = untouched. Modulated sprites
+				// can't fade via colour scale (it darkens instead), so they draw
+				// only while their centre sample is visible.
+				if( TileFlags & PF_Modulated )
+					Occluded = !CenterVis;
+				else
+				{
+					Occluded = (Visible==0);
+					Color *= (FLOAT)Visible / 5.f;
+				}
+				if( ProbeSprite )
+					debugf( "PROBESPRITE: %s scr=(%.0f,%.0f) size=%.0f actorZ=%.0f visible=%i/5 center=%i occluded=%i",
+						Sprite->Actor->GetName(), Sprite->ScreenX, Sprite->ScreenY, XScale,
+						ActorZ, Visible, CenterVis, (INT)Occluded );
+			}
+		}
+		if( Texture && !Occluded ) Frame->Viewport->Canvas->DrawIcon
 		(
 			Texture->Get( Frame->Viewport->CurrentTime ),
 			(Sprite->ScreenX - XScale/2) / UISc,
@@ -753,7 +836,7 @@ void URender::DrawActorSprite( FSceneNode* Frame, FDynamicSprite* Sprite )
 			Sprite->Z,
 			Color,
 			FPlane(0,0,0,0),
-			PolyFlags | PF_TwoSided | Texture->PolyFlags
+			TileFlags
 		);
 		if( Sprite->Actor->DrawType==DT_SpriteAnimOnce )
 		{
