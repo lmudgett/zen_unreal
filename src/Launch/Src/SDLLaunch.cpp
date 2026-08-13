@@ -435,16 +435,303 @@ static void RunActorProbe( UEngine* Engine )
 			continue;
 		if( Filter[0] && !appStrfind( const_cast<char*>(Act->GetClass()->GetName()), Filter ) )
 			continue;
-		debugf( NAME_Log, "ACTORPROBE %-22s %-26s (%7.0f,%8.0f,%7.0f) corona=%i skin=%s mesh=%s collide=%i",
+		// Zone facts too: an actor whose zone has a SkyZone is OUTDOORS, which is
+		// how to find an open-sky camera spot without guessing yaws (fog matters
+		// for effect rendering as well, so report it alongside).
+		AZoneInfo* Zone = Act->Region.Zone;
+		debugf( NAME_Log, "ACTORPROBE %-22s %-26s (%7.0f,%8.0f,%7.0f) rot=%i:%i corona=%i skin=%s mesh=%s collide=%i zone=%s sky=%i fog=%i",
 			Act->GetClass()->GetName(), Act->GetName(),
 			Act->Location.X, Act->Location.Y, Act->Location.Z,
+			(INT)Act->Rotation.Pitch, (INT)Act->Rotation.Yaw,
 			(INT)Act->bCorona,
 			Act->Skin ? Act->Skin->GetName() : "None",
 			Act->Mesh ? Act->Mesh->GetName() : "None",
-			(INT)Act->bCollideActors );
+			(INT)Act->bCollideActors,
+			Zone ? Zone->GetName() : "None",
+			(INT)( Zone && Zone->SkyZone ),
+			(INT)( Zone && Zone->bFogZone ) );
+		// Second line for anything that draws as a sprite: DrawType/Style/Texture
+		// are what decide the blend mode, and a sprite rendering as a flat opaque
+		// rectangle is exactly a Style that resolved to "no blend".
+		if( Act->DrawType==DT_Sprite || Act->DrawType==DT_SpriteAnimOnce )
+			debugf( NAME_Log, "ACTORPROBE     ^ sprite draw=%i style=%i scale=%.2f hidden=%i tex=%s",
+				(INT)Act->DrawType, (INT)Act->Style, Act->DrawScale, (INT)Act->bHidden,
+				Act->Texture ? Act->Texture->GetPathName() : "None" );
 		Logged++;
 	}
 	debugf( NAME_Log, "ACTORPROBE: %i actor(s) logged (filter '%s')", Logged, Filter );
+	unguard;
+}
+
+/*-----------------------------------------------------------------------------
+	Texture probe (-probetex).
+-----------------------------------------------------------------------------*/
+
+// -probetex=<substr> dumps the facts that decide whether a sprite blends
+// invisibly: its PolyFlags (bMasked?), and the palette entry its BORDER texels
+// use. A translucent sprite is only invisible where its texels are BLACK, so a
+// non-black border palette entry renders the whole quad as a visible rectangle
+// -- the "square haze" signature. Corner + edge-midpoint texels are sampled
+// because that is exactly the region that should vanish.
+static void RunTexProbe()
+{
+	guard(RunTexProbe);
+	char Filter[64]="";
+	Parse( appCmdLine(), "PROBETEX=", Filter, ARRAY_COUNT(Filter) );
+	INT Logged=0;
+	for( TObjectIterator<UTexture> It; It; ++It )
+	{
+		UTexture* T = *It;
+		if( Filter[0] && !appStrfind( const_cast<char*>(T->GetPathName()), Filter ) )
+			continue;
+		if( !T->GetNumMips() )
+			continue;
+		FMipmap* M = T->GetMip(0);
+		INT U = M->USize, V = M->VSize;
+		if( U<=0 || V<=0 || M->DataArray.Num() < U*V )
+		{
+			debugf( NAME_Log, "TEXPROBE %-40s %ix%i NO DATA (%i bytes)", T->GetPathName(), U, V, M->DataArray.Num() );
+			continue;
+		}
+		FColor* Pal = T->GetColors();
+		BYTE* D = &M->DataArray(0);
+		// Border sample points: 4 corners + 4 edge midpoints.
+		INT SX[8] = { 0, U-1, 0,   U-1, U/2, U/2, 0,   U-1 };
+		INT SY[8] = { 0, 0,   V-1, V-1, 0,   V-1, V/2, V/2 };
+		INT MaxLum=0, WorstIdx=0;
+		for( INT i=0; i<8; i++ )
+		{
+			BYTE Idx = D[ SY[i]*U + SX[i] ];
+			FColor C = Pal ? Pal[Idx] : FColor(0,0,0,0);
+			INT Lum = (INT)C.R + C.G + C.B;
+			if( Lum > MaxLum ) { MaxLum = Lum; WorstIdx = Idx; }
+		}
+		FColor P0 = Pal ? Pal[0] : FColor(0,0,0,0);
+		FColor PW = Pal ? Pal[WorstIdx] : FColor(0,0,0,0);
+		debugf( NAME_Log, "TEXPROBE %-40s %3ix%-3i mips=%i flags=%08X masked=%i pal0=(%3i,%3i,%3i) brightestBorder=idx%-3i (%3i,%3i,%3i)",
+			T->GetPathName(), U, V, T->GetNumMips(), T->PolyFlags,
+			(INT)((T->PolyFlags & PF_Masked)!=0),
+			P0.R, P0.G, P0.B, WorstIdx, PW.R, PW.G, PW.B );
+		// -probetexdump additionally writes EVERY mip through the palette as
+		// Texprobe_<name>_m<i>.bmp, so the actual texel fields can be inspected
+		// -- border samples alone can't show whether a level's background is
+		// clean black or a noise/averaging floor that will lift the whole quad
+		// under additive blend (minified sprites sample the SMALL mips, where
+		// box-filtering may have smeared the image over the entire tile).
+		if( Pal && ParseParam( appCmdLine(), "PROBETEXDUMP" ) )
+		{
+			for( INT iMip=0; iMip<T->GetNumMips(); iMip++ )
+			{
+				FMipmap* MM = T->GetMip(iMip);
+				INT MU = MM->USize, MV = MM->VSize;
+				if( MU<=0 || MV<=0 || MM->DataArray.Num() < MU*MV )
+					continue;
+				BYTE* MD = &MM->DataArray(0);
+				char BmpName[128];
+				appSprintf( BmpName, "Texprobe_%s_m%i.bmp", T->GetName(), iMip );
+				INT RowBytes = (MU*3+3)&~3, DataBytes = RowBytes*MV, FileBytes = 54+DataBytes;
+				BYTE* Bmp = (BYTE*)appMalloc( FileBytes, "TexProbeBmp" );
+				appMemset( Bmp, 0, FileBytes );
+				Bmp[0]='B'; Bmp[1]='M';
+				*(INT*)(Bmp+ 2) = FileBytes;
+				*(INT*)(Bmp+10) = 54;
+				*(INT*)(Bmp+14) = 40;
+				*(INT*)(Bmp+18) = MU;
+				*(INT*)(Bmp+22) = MV;
+				*(WORD*)(Bmp+26) = 1;
+				*(WORD*)(Bmp+28) = 24;
+				for( INT y=0; y<MV; y++ )
+					for( INT x=0; x<MU; x++ )
+					{
+						FColor C = Pal[ MD[y*MU+x] ];
+						BYTE* P = Bmp + 54 + (MV-1-y)*RowBytes + x*3;
+						P[0]=C.B; P[1]=C.G; P[2]=C.R;
+					}
+				FILE* F = appFopen( BmpName, "wb" );
+				if( F )
+				{
+					appFwrite( Bmp, 1, FileBytes, F );
+					appFclose( F );
+				}
+				appFree( Bmp );
+			}
+		}
+		Logged++;
+	}
+	debugf( NAME_Log, "TEXPROBE: %i texture(s) logged (filter '%s')", Logged, Filter );
+	unguard;
+}
+
+/*-----------------------------------------------------------------------------
+	Surface probe (-probesurfs).
+-----------------------------------------------------------------------------*/
+
+// -probesurfs tallies the level's BSP surfaces by (texture, polyflags): which
+// texture is actually ON a reported surface, its class (procedural fractal vs
+// plain bitmap), and the surface flags that drive liquid looks (translucent,
+// auto-pan, wavy). Non-interactive: log, then exit.
+static void RunSurfProbe( UEngine* Engine )
+{
+	guard(RunSurfProbe);
+	UGameEngine* Game = Cast<UGameEngine>( Engine );
+	if( !Game || !Game->GLevel || !Game->GLevel->Model )
+	{
+		debugf( NAME_Log, "SURFPROBE: no level" );
+		return;
+	}
+	UModel* Model = Game->GLevel->Model;
+	enum {MAX_TALLY=512};
+	UTexture* TalTex  [MAX_TALLY];
+	DWORD     TalFlags[MAX_TALLY];
+	INT       TalCount[MAX_TALLY];
+	INT NumTally=0;
+	for( INT i=0; i<Model->Surfs->Num(); i++ )
+	{
+		FBspSurf& Surf = Model->Surfs->Element(i);
+		INT t;
+		for( t=0; t<NumTally; t++ )
+			if( TalTex[t]==Surf.Texture && TalFlags[t]==Surf.PolyFlags )
+				break;
+		if( t==NumTally )
+		{
+			if( NumTally==MAX_TALLY )
+				continue;
+			TalTex[t] = Surf.Texture; TalFlags[t] = Surf.PolyFlags; TalCount[t] = 0;
+			NumTally++;
+		}
+		TalCount[t]++;
+	}
+	for( INT t=0; t<NumTally; t++ )
+	{
+		UTexture* T = TalTex[t];
+		// Representative world point: centroid of the first BSP node drawn
+		// with this (texture,flags) pair -- enough to aim a -probeview shot.
+		FVector Centroid(0,0,0);
+		UBOOL Found=0;
+		for( INT n=0; n<Model->Nodes->Num() && !Found; n++ )
+		{
+			FBspNode& Node = Model->Nodes->Element(n);
+			if( Node.NumVertices<3 || Node.iSurf>=Model->Surfs->Num() )
+				continue;
+			FBspSurf& S = Model->Surfs->Element(Node.iSurf);
+			if( S.Texture!=TalTex[t] || S.PolyFlags!=TalFlags[t] )
+				continue;
+			for( INT v=0; v<Node.NumVertices; v++ )
+				Centroid += Model->Points->Element( Model->Verts->Element(Node.iVertPool+v).pVertex );
+			Centroid /= Node.NumVertices;
+			Found=1;
+		}
+		debugf( NAME_Log, "SURFPROBE %-40s class=%-14s surfs=%-4i flags=%08X at(%7.0f,%8.0f,%7.0f)%s%s%s%s%s",
+			T ? T->GetPathName() : "None",
+			T ? T->GetClass()->GetName() : "None",
+			TalCount[t], TalFlags[t],
+			Centroid.X, Centroid.Y, Centroid.Z,
+			(TalFlags[t] & PF_Translucent) ? " TRANSLUCENT" : "",
+			(TalFlags[t] & PF_AutoUPan   ) ? " UPAN" : "",
+			(TalFlags[t] & PF_AutoVPan   ) ? " VPAN" : "",
+			(TalFlags[t] & PF_SmallWavy  ) ? " SMALLWAVY" : "",
+			(TalFlags[t] & PF_BigWavy    ) ? " BIGWAVY" : "" );
+	}
+	debugf( NAME_Log, "SURFPROBE: %i unique (texture,flags) pairs over %i surfs", NumTally, Model->Surfs->Num() );
+	unguard;
+}
+
+/*-----------------------------------------------------------------------------
+	Animation probe (-probeanim).
+-----------------------------------------------------------------------------*/
+
+// -probeanim[=<substr>] answers "is this texture's animation actually
+// running?" headlessly. Fractal textures (fire/water/wave/wet/ice) are ticked
+// 70 steps at the 35Hz reference rate -- 2 seconds of animation -- and the
+// number of mip-0 bytes that changed is logged: 0 means the procedural
+// animation is dead, which on screen looks like a static image that only
+// pans. Frame-animated textures log their AnimNext chain instead. Class,
+// TF_Realtime and mip count are logged for all matches.
+static void RunAnimProbe()
+{
+	guard(RunAnimProbe);
+	char Filter[64]="";
+	Parse( appCmdLine(), "PROBEANIM=", Filter, ARRAY_COUNT(Filter) );
+	INT Logged=0;
+	for( TObjectIterator<UTexture> It; It; ++It )
+	{
+		UTexture* T = *It;
+		if( Filter[0] && !appStrfind( const_cast<char*>(T->GetPathName()), Filter ) )
+			continue;
+		UBOOL IsFractal=0;
+		for( UClass* C=T->GetClass(); C; C=C->GetSuperClass() )
+			if( appStricmp( C->GetName(), "FractalTexture" )==0 )
+				{ IsFractal=1; break; }
+		if( !IsFractal && !Filter[0] )
+			continue;
+		INT Changed=-1, Total=0;
+		UBOOL Dump = Filter[0] && ParseParam( appCmdLine(), "PROBEANIMDUMP" );
+		if( IsFractal && T->GetNumMips() && T->GetMip(0)->DataArray.Num() )
+		{
+			FMipmap* M = T->GetMip(0);
+			Total = M->DataArray.Num();
+			BYTE* Before = (BYTE*)appMalloc( Total, "AnimProbe" );
+			appMemcpy( Before, &M->DataArray(0), Total );
+			DOUBLE Time = T->LastUpdateTime;
+			for( INT i=0; i<=70; i++ )
+			{
+				// -probeanimdump (with a filter) writes the palette-resolved
+				// output every 10 ticks, so the animation's actual look --
+				// local ripples vs a uniformly sliding image -- can be
+				// inspected offline.
+				if( Dump && (i%10)==0 && T->GetColors() )
+				{
+					FColor* Pal = T->GetColors();
+					INT MU = M->USize, MV = M->VSize;
+					BYTE* MD = &M->DataArray(0);
+					char BmpName[128];
+					appSprintf( BmpName, "Animprobe_%s_t%02i.bmp", T->GetName(), i );
+					INT RowBytes = (MU*3+3)&~3, DataBytes = RowBytes*MV, FileBytes = 54+DataBytes;
+					BYTE* Bmp = (BYTE*)appMalloc( FileBytes, "AnimProbeBmp" );
+					appMemset( Bmp, 0, FileBytes );
+					Bmp[0]='B'; Bmp[1]='M';
+					*(INT*)(Bmp+ 2) = FileBytes;
+					*(INT*)(Bmp+10) = 54;
+					*(INT*)(Bmp+14) = 40;
+					*(INT*)(Bmp+18) = MU;
+					*(INT*)(Bmp+22) = MV;
+					*(WORD*)(Bmp+26) = 1;
+					*(WORD*)(Bmp+28) = 24;
+					for( INT y=0; y<MV; y++ )
+						for( INT x=0; x<MU; x++ )
+						{
+							FColor C = Pal[ MD[y*MU+x] ];
+							BYTE* P = Bmp + 54 + (MV-1-y)*RowBytes + x*3;
+							P[0]=C.B; P[1]=C.G; P[2]=C.R;
+						}
+					FILE* F = appFopen( BmpName, "wb" );
+					if( F )
+					{
+						appFwrite( Bmp, 1, FileBytes, F );
+						appFclose( F );
+					}
+					appFree( Bmp );
+				}
+				if( i==70 )
+					break;
+				Time += 1.0/35.0;
+				T->Update( Time );
+			}
+			Changed=0;
+			BYTE* After = &M->DataArray(0);
+			for( INT i=0; i<Total; i++ )
+				if( Before[i]!=After[i] )
+					Changed++;
+			appFree( Before );
+		}
+		debugf( NAME_Log, "ANIMPROBE %-40s class=%-14s realtime=%i mips=%i animNext=%-20s ticked70: changed %i/%i bytes",
+			T->GetPathName(), T->GetClass()->GetName(),
+			(INT)((T->TextureFlags & TF_Realtime)!=0), T->GetNumMips(),
+			T->AnimNext ? T->AnimNext->GetName() : "None",
+			Changed, Total );
+		Logged++;
+	}
+	debugf( NAME_Log, "ANIMPROBE: %i texture(s) logged (filter '%s')", Logged, Filter );
 	unguard;
 }
 
@@ -576,6 +863,55 @@ static void MainLoop( UEngine* Engine )
 		}
 	}
 
+	// -probefx=x:y:z:ClassName spawns that class there -probefxlead frames
+	// BEFORE the -probeview screenshot, so a short-lived animated effect
+	// (explosions, smoke) is mid-animation when the shot is read back rather
+	// than one frame stale. -probefxscale overrides DrawScale. Deterministic
+	// repro for effect-rendering reports: no weapon, no aiming, no timing luck.
+	FVector	ProbeFxLoc(0,0,0);
+	char	ProbeFxName[64]="";
+	FLOAT	ProbeFxScale = 0.f;
+	INT		ProbeFxLead = 20;
+	UBOOL	ProbeFx = 0, ProbeFxSpawned = 0, ProbeFxAim = 0, ProbeFxFire = 0;
+	FRotator ProbeFxRot(0,0,0);
+	{
+		char Spec[256]="";
+		if( Parse( appCmdLine(), "PROBEFX=", Spec, ARRAY_COUNT(Spec) ) )
+		{
+			FLOAT X,Y,Z;
+			if( sscanf( Spec, "%f:%f:%f:%63s", &X,&Y,&Z, ProbeFxName )==4 )
+			{
+				ProbeFxLoc = FVector(X,Y,Z);
+				ProbeFx = 1;
+			}
+			else debugf( NAME_Log, "PROBEFX: need -probefx=x:y:z:ClassName (got '%s')", Spec );
+		}
+		// -probefxaim=<ClassName> instead traces the player's OWN aim (eye +
+		// ViewRotation) to the first thing a projectile would hit and spawns the
+		// effect a rocket's-width off that surface. With a loaded save that is
+		// literally "fire a rocket from where I was standing" -- no coordinates
+		// to guess, and it reproduces the impact geometry, which is what makes
+		// or breaks effect rendering.
+		else if( Parse( appCmdLine(), "PROBEFXAIM=", ProbeFxName, ARRAY_COUNT(ProbeFxName) ) )
+		{
+			ProbeFx = ProbeFxAim = 1;
+		}
+		// -probefire=<ProjectileClass> launches the real thing from the muzzle
+		// along the player's aim, rotation and all -- so it flies, lays its smoke
+		// trail and explodes on its own. The only faithful repro of "I shot a
+		// rocket here": a hand-placed explosion skips the trail entirely.
+		else if( Parse( appCmdLine(), "PROBEFIRE=", ProbeFxName, ARRAY_COUNT(ProbeFxName) ) )
+		{
+			ProbeFx = ProbeFxAim = ProbeFxFire = 1;
+		}
+		if( ProbeFx )
+		{
+			Parse( appCmdLine(), "PROBEFXLEAD=", ProbeFxLead );
+			Parse( appCmdLine(), "PROBEFXSCALE=", ProbeFxScale );
+			debugf( NAME_Log, "PROBEFX: %s lead=%i frames aim=%i", ProbeFxName, ProbeFxLead, (INT)ProbeFxAim );
+		}
+	}
+
 	DOUBLE StatWindowStart = OldTime;
 	INT    StatFrames = 0, StatSpikes = 0;
 	DOUBLE StatMax = 0.0, StatSum = 0.0, TickSum = 0.0, PrevTick = 0.0;
@@ -669,7 +1005,7 @@ static void MainLoop( UEngine* Engine )
 
 		char ProbeExec[128]="";
 		UBOOL HasExec = Parse( appCmdLine(), "PROBEEXEC=", ProbeExec, ARRAY_COUNT(ProbeExec) );
-		if( !ProbeWalk && (PinView || HasExec) && Engine->Client )
+		if( !ProbeWalk && (PinView || HasExec || ProbeFx) && Engine->Client )
 		{
 			// Freeze the view actor there: physics off and no world collision,
 			// otherwise gravity//pushout move it before the shot. Skipped when
@@ -699,7 +1035,78 @@ static void MainLoop( UEngine* Engine )
 				P->BaseEyeHeight = 0.f;
 				P->EyeHeight     = 0.f;
 			}
-			if( ++FrameNum == ProbeFrames )
+			++FrameNum;
+			if( ProbeFx && !ProbeFxSpawned && FrameNum >= ProbeFrames-ProbeFxLead )
+			{
+				UGameEngine* G = Cast<UGameEngine>( Engine );
+				if( G && G->GLevel )
+				{
+					ProbeFxSpawned = 1;
+					if( ProbeFxAim )
+					{
+						APlayerPawn* P = Engine->Client->Viewports(0)->Actor;
+						if( !P )
+						{
+							debugf( NAME_Log, "PROBEFX: aim failed -- no view actor" );
+							continue;
+						}
+						FVector Eye = P->Location + FVector(0,0,P->BaseEyeHeight);
+						FVector Dir = P->ViewRotation.Vector();
+						FCheckResult Hit(1.f);
+						G->GLevel->SingleLineCheck( Hit, P, Eye + Dir*10000.f, Eye, TRACE_VisBlocking );
+						if( ProbeFxFire )
+						{
+							// Muzzle, aimed: the projectile does the rest itself.
+							ProbeFxLoc = Eye + Dir*40.f;
+							ProbeFxRot = P->ViewRotation;
+						}
+						else
+						{
+							ProbeFxLoc = ( Hit.Time < 1.f )
+								? Hit.Location + Hit.Normal*16.f
+								: Eye + Dir*512.f;
+						}
+						debugf( NAME_Log, "PROBEFX aim: eye (%.0f,%.0f,%.0f) view %i:%i -> spawn (%.0f,%.0f,%.0f) wall dist=%.0f fire=%i",
+							Eye.X,Eye.Y,Eye.Z, (INT)P->ViewRotation.Pitch, (INT)P->ViewRotation.Yaw,
+							ProbeFxLoc.X, ProbeFxLoc.Y, ProbeFxLoc.Z,
+							Hit.Time<1.f ? (Hit.Location-Eye).Size() : -1.f, (INT)ProbeFxFire );
+					}
+					UClass* C = FindObject<UClass>( ANY_PACKAGE, ProbeFxName );
+					APawn* Shooter = ProbeFxFire ? (APawn*)Engine->Client->Viewports(0)->Actor : NULL;
+					AActor* A = C ? G->GLevel->SpawnActor( C, NAME_None, Shooter, Shooter, ProbeFxLoc, ProbeFxRot, NULL, 0, 1 ) : NULL;
+					if( A )
+					{
+						if( ProbeFxScale > 0.f )
+							A->DrawScale = ProbeFxScale;
+						// Launch it by hand. Entering the projectile's auto state
+						// (which is what normally sets Velocity) does not happen
+						// for a C++-spawned actor here, so it would just hover at
+						// the muzzle dribbling trail smoke.
+						if( ProbeFxFire )
+						{
+							AProjectile* Proj = Cast<AProjectile>( A );
+							FLOAT Speed = Proj ? Proj->speed : 900.f;
+							A->Velocity = ProbeFxRot.Vector() * Speed;
+							if( Proj )
+								Proj->Acceleration = ProbeFxRot.Vector() * 50.f;
+							debugf( NAME_Log, "PROBEFX: launched at %.0f u/s", Speed );
+						}
+						debugf( NAME_Log, "PROBEFX: spawned %s at (%.0f,%.0f,%.0f) scale=%.2f style=%i",
+							A->GetName(), A->Location.X, A->Location.Y, A->Location.Z, A->DrawScale, (INT)A->Style );
+					}
+					else debugf( NAME_Log, "PROBEFX: spawn FAILED (class '%s' %s)", ProbeFxName, C ? "spawn refused" : "not found" );
+				}
+			}
+			// -probeshotevery=N additionally screenshots every N frames from
+			// half-way to ProbeFrames on -- a same-run frame series, so texture
+			// animation can be compared shot-to-shot without cross-run timing
+			// noise.
+			INT ShotEvery = 0;
+			Parse( appCmdLine(), "PROBESHOTEVERY=", ShotEvery );
+			if( ShotEvery > 0 && FrameNum >= ProbeFrames/2 && FrameNum < ProbeFrames && ((ProbeFrames-FrameNum) % ShotEvery)==0 )
+				for( INT v=0; v<Engine->Client->Viewports.Num(); v++ )
+					Engine->Client->Viewports(v)->Exec( "SHOT", GSystem );
+			if( FrameNum == ProbeFrames )
 			{
 				if( HasExec )
 					Engine->Exec( ProbeExec, GSystem );
@@ -849,6 +1256,21 @@ int main( int argc, char** argv )
 			if( !GIsRequestingExit && ParseParam( appCmdLine(), "PROBEACTORS" ) )
 			{
 				RunActorProbe( Engine );
+				GIsRequestingExit = 1;
+			}
+			if( !GIsRequestingExit && ParseParam( appCmdLine(), "PROBETEX" ) )
+			{
+				RunTexProbe();
+				GIsRequestingExit = 1;
+			}
+			if( !GIsRequestingExit && ParseParam( appCmdLine(), "PROBESURFS" ) )
+			{
+				RunSurfProbe( Engine );
+				GIsRequestingExit = 1;
+			}
+			if( !GIsRequestingExit && ParseParam( appCmdLine(), "PROBEANIM" ) )
+			{
+				RunAnimProbe();
 				GIsRequestingExit = 1;
 			}
 			if( !GIsRequestingExit )
