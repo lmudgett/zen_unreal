@@ -464,6 +464,342 @@ static void RunActorProbe( UEngine* Engine )
 }
 
 /*-----------------------------------------------------------------------------
+	Creature AI audit (-probeai).
+-----------------------------------------------------------------------------*/
+
+// -probeai watches every non-player pawn in a running level -- Nali, Skaarj,
+// Krall, Titans, the lot -- and reports what its AI actually did, so "are the
+// creatures working?" is answered by evidence rather than by walking the map
+// and forming an impression. Sampled while the game ticks (see MainLoop) and
+// summarized at exit.
+//
+// What it records per creature, and why each matters:
+//   state    -- the UnrealScript state it is executing. A creature that never
+//               leaves its initial state is asleep; one cycling states is
+//               running its script.
+//   enemy    -- did it ever acquire one? This is perception (sight/hearing)
+//               working, and it is the difference between hostile AI and
+//               scenery.
+//   moved    -- total distance travelled. Movement means pathing and physics
+//               are carrying it; a creature that wants an enemy but never
+//               moves is stuck.
+//   health   -- fell = it took damage (combat is resolving both ways).
+//   NaN      -- a non-finite location. The 1998 physics is float-fragile and
+//               a NaN here is the pathing crash signature, so it is called
+//               out loudly rather than averaged away.
+struct FAIWatch
+{
+	// Identity is COPIED at first sight, never read back off the pointer:
+	// creatures die (and their memory is reused), so a report that
+	// dereferences a stored actor at the end of the run crashes on exactly
+	// the maps where the AI was busiest.
+	AActor*		Actor;			// identity only -- compared, never dereferenced after Alive=0
+	char		ClassName[48];
+	char		Name[48];
+	FLOAT		SightRadius, PeripheralVision;
+	INT			Vis;
+	UBOOL		Alive;
+	FName		FirstState, LastState;
+	INT			StateChanges;
+	FVector		FirstLoc, LastLoc;
+	FLOAT		Moved;
+	FLOAT		StartHealth, MinHealth;
+	UBOOL		EverEnemy, EverBadLoc;
+	// Where the perception chain stands, sampled the same way the engine
+	// walks it (UnPawn.cpp ShowSelf): the player shows itself to every pawn,
+	// each pawn is asked whether its current state listens for SeePlayer, and
+	// if so whether it has line of sight. Recording all three separates "the
+	// creature cannot see the player" from "the creature is not listening"
+	// from "the creature saw and ignored it".
+	FLOAT		MinDist;
+	UBOOL		EverProbing, EverLOS;
+	// Did it ever run an alarm? A friendly Nali that spots the player goes to
+	// TriggerAlarm, walks to its AlarmPoint and fires that point's Event --
+	// which is how the Nali "show you a secret" behaviour is built (see
+	// ScriptedPawn's TriggerAlarm state). It is transient: the Nali returns to
+	// Roaming afterwards, so the final state says nothing about whether it
+	// happened. Recorded as it passes.
+	UBOOL		EverAlarm;
+	char		AlarmTag[32];	// mapper-assigned; "" = this one can never show a secret
+	INT			Attitude;		// AttitudeToPlayer: <4 hostile, 4 ignore, >4 friendly
+};
+static TArray<FAIWatch> GAIWatch;
+// Level time spanned by the audit. Frames are NOT seconds here -- the renderer
+// runs at hundreds of frames a second, so a few hundred frames is a blink, far
+// too short for a state machine built on Sleep() to show anything. Reported so
+// a run that saw no AI activity can be told apart from one that was over
+// before the AI had a chance.
+static FLOAT GAIStartTime = -1.f, GAIEndTime = -1.f;
+// The subject's own health. Creatures acquiring an enemy proves perception;
+// the subject losing health proves the rest -- that they closed the distance,
+// chose an attack and connected.
+static INT GAISubjStart = -1, GAISubjEnd = -1;
+
+// AlarmTag and AttitudeToPlayer live in UnrealI's ScriptedPawn script, not in
+// any C++ class, so they are read through the property table the way the editor
+// reads any script property. AlarmTag is the whole question for the "Nali shows
+// you a secret" behaviour: only a creature the mapper gave one can lead anybody
+// anywhere, so a run that faces a Nali without one proves nothing.
+static FName GetNameProp( AActor* A, const char* PropName )
+{
+	guardSlow(GetNameProp);
+	UNameProperty* P = FindField<UNameProperty>( A->GetClass(), PropName );
+	return P ? *(FName*)((BYTE*)A + P->Offset) : FName(NAME_None);
+	unguardSlow;
+}
+static INT GetByteProp( AActor* A, const char* PropName )
+{
+	guardSlow(GetByteProp);
+	UByteProperty* P = FindField<UByteProperty>( A->GetClass(), PropName );
+	return P ? (INT)*((BYTE*)A + P->Offset) : -1;
+	unguardSlow;
+}
+
+// The two states a creature passes through while running an alarm. Compared by
+// TEXT, not by constructing FNames: a name looked up with FNAME_Find that is
+// not in the table comes back as NAME_None, which would then match every
+// creature sitting in no state at all.
+static UBOOL IsAlarmState( FName State )
+{
+	if( State==NAME_None )
+		return 0;
+	return appStricmp( *State, "TriggerAlarm" )==0
+		|| appStricmp( *State, "AlarmPaused"  )==0;
+}
+
+// Movers that actually moved. An AlarmPoint's Event is nearly always a door,
+// so a Nali reaching its alarm should be followed by a Mover going somewhere:
+// that is the secret opening, and it is the difference between the Nali
+// playing out the walk and the walk having any effect.
+struct FMoverWatch { AActor* Mover; FVector Start; UBOOL Moved; };
+static TArray<FMoverWatch> GMovers;
+
+static UBOOL IsFiniteVec( const FVector& V )
+{
+	// Non-finite compares false against itself and against any bound.
+	return (V.X==V.X) && (V.Y==V.Y) && (V.Z==V.Z)
+		&& V.X>-1e9f && V.X<1e9f && V.Y>-1e9f && V.Y<1e9f && V.Z>-1e9f && V.Z<1e9f;
+}
+
+static void SampleAI( UEngine* Engine )
+{
+	guard(SampleAI);
+	UGameEngine* Game = Cast<UGameEngine>( Engine );
+	if( !Game || !Game->GLevel )
+		return;
+	ULevel* Level = Game->GLevel;
+	if( Level->GetLevelInfo() )
+	{
+		GAIEndTime = Level->GetLevelInfo()->TimeSeconds;
+		if( GAIStartTime < 0.f )
+			GAIStartTime = GAIEndTime;
+	}
+	// The player as the AI sees it. Line-of-sight tests trace, so the
+	// perception sampling is throttled rather than run every frame.
+	static INT Tick = 0;
+	UBOOL DeepSample = ((Tick++) % 20)==0;
+	// Anything not seen in this pass has been destroyed; its stored facts stay
+	// in the report but its pointer is never touched again.
+	if( DeepSample )
+		for( INT w=0; w<GAIWatch.Num(); w++ )
+			GAIWatch(w).Alive = 0;
+	APawn* Player = NULL;
+	for( INT i=0; i<Level->Num(); i++ )
+	{
+		APawn* P = Cast<APawn>( Level->Element(i) );
+		if( P && P->bIsPlayer )
+			{ Player = P; break; }
+	}
+	if( Player )
+	{
+		GAISubjEnd = Player->Health;
+		if( GAISubjStart < 0 )
+			GAISubjStart = GAISubjEnd;
+	}
+	if( Player && GAIStartTime==GAIEndTime )
+		debugf( NAME_Log, "AIPROBE player: %s '%s' at (%.0f,%.0f,%.0f) health=%i hidden=%i collide=%i zone=%s VISIBILITY=%i sightradius=%.0f",
+			Player->GetClass()->GetName(), Player->GetName(),
+			Player->Location.X, Player->Location.Y, Player->Location.Z,
+			Player->Health, (INT)Player->bHidden, (INT)Player->bCollideActors,
+			Player->Region.Zone ? Player->Region.Zone->GetName() : "None",
+			(INT)Player->Visibility, Player->SightRadius );
+	// Mover positions: recorded on the first pass, compared on later ones.
+	if( DeepSample )
+		for( INT i=0; i<Level->Num(); i++ )
+		{
+			AActor* A = Level->Element(i);
+			if( !A || !A->IsA(AMover::StaticClass) )
+				continue;
+			INT m;
+			for( m=0; m<GMovers.Num(); m++ )
+				if( GMovers(m).Mover==A )
+					break;
+			if( m==GMovers.Num() )
+			{
+				FMoverWatch New;
+				New.Mover = A;
+				New.Start = A->Location;
+				New.Moved = 0;
+				GMovers.AddItem( New );
+			}
+			else if( (A->Location-GMovers(m).Start).SizeSquared() > 16.f )
+				GMovers(m).Moved = 1;
+		}
+	for( INT i=0; i<Level->Num(); i++ )
+	{
+		APawn* P = Cast<APawn>( Level->Element(i) );
+		if( !P || P->bIsPlayer )
+			continue;
+		FName State = P->GetMainFrame() && P->GetMainFrame()->StateNode
+			? P->GetMainFrame()->StateNode->GetFName() : NAME_None;
+		INT w;
+		for( w=0; w<GAIWatch.Num(); w++ )
+			if( GAIWatch(w).Actor==(AActor*)P )
+				break;
+		if( w==GAIWatch.Num() )
+		{
+			FAIWatch New;
+			New.Actor       = P;
+			appStrncpy( New.ClassName, P->GetClass()->GetName(), ARRAY_COUNT(New.ClassName) );
+			appStrncpy( New.Name,      P->GetName(),             ARRAY_COUNT(New.Name)      );
+			New.SightRadius      = P->SightRadius;
+			New.PeripheralVision = P->PeripheralVision;
+			New.Vis              = P->Visibility;
+			New.Alive            = 1;
+			New.FirstState  = New.LastState = State;
+			New.StateChanges= 0;
+			New.FirstLoc    = New.LastLoc = P->Location;
+			New.Moved       = 0.f;
+			New.StartHealth = New.MinHealth = P->Health;
+			New.EverEnemy   = P->Enemy!=NULL;
+			New.EverBadLoc  = !IsFiniteVec( P->Location );
+			New.MinDist     = Player ? (P->Location-Player->Location).Size() : -1.f;
+			New.EverProbing = 0;
+			New.EverLOS     = 0;
+			New.EverAlarm   = IsAlarmState( State );
+			appStrncpy( New.AlarmTag, *GetNameProp( P, "AlarmTag" ), ARRAY_COUNT(New.AlarmTag) );
+			if( appStricmp( New.AlarmTag, "None" )==0 )
+				New.AlarmTag[0] = 0;
+			New.Attitude    = GetByteProp( P, "AttitudeToPlayer" );
+			GAIWatch.AddItem( New );
+			continue;
+		}
+		FAIWatch& W = GAIWatch(w);
+		W.Alive = 1;
+		if( IsAlarmState( State ) )
+			W.EverAlarm = 1;
+		if( State!=W.LastState )
+		{
+			W.StateChanges++;
+			W.LastState = State;
+		}
+		if( !IsFiniteVec( P->Location ) )
+			W.EverBadLoc = 1;
+		else
+		{
+			W.Moved += (P->Location - W.LastLoc).Size();
+			W.LastLoc = P->Location;
+		}
+		if( P->Enemy )
+			W.EverEnemy = 1;
+		W.MinHealth = Min( W.MinHealth, (FLOAT)P->Health );
+		if( Player && DeepSample )
+		{
+			FLOAT D = (P->Location-Player->Location).Size();
+			W.MinDist = W.MinDist<0.f ? D : Min( W.MinDist, D );
+			if( P->IsProbing( NAME_SeePlayer ) )
+			{
+				W.EverProbing = 1;
+				if( P->LineOfSightTo( Player, 1 ) )
+					W.EverLOS = 1;
+			}
+		}
+	}
+	unguard;
+}
+
+static void ReportAI( UEngine* Engine )
+{
+	guard(ReportAI);
+	// The nearest creature's actual sight trace, spelled out. Every creature
+	// traces to the same subject, so a subject standing inside rock fails all
+	// of them identically and looks exactly like blind AI. Reporting what the
+	// trace hit separates "the level is in the way" (a harness problem) from
+	// "the perception code is broken" (an engine problem).
+	{
+		UGameEngine* Game = Cast<UGameEngine>( Engine );
+		if( Game && Game->GLevel )
+		{
+			APawn* Player = NULL;
+			for( INT i=0; i<Game->GLevel->Num(); i++ )
+			{
+				APawn* P = Cast<APawn>( Game->GLevel->Element(i) );
+				if( P && P->bIsPlayer )
+					{ Player = P; break; }
+			}
+			FAIWatch* Near = NULL;
+			for( INT w=0; w<GAIWatch.Num(); w++ )
+				if( GAIWatch(w).Alive && GAIWatch(w).MinDist>=0.f
+				&& (!Near || GAIWatch(w).MinDist<Near->MinDist) )
+					Near = &GAIWatch(w);
+			if( Player && Near )
+			{
+				APawn* C = (APawn*)Near->Actor;
+				FVector Eye = C->Location; Eye.Z += C->BaseEyeHeight;
+				FVector Body = Player->Location; Body.Z += Player->CollisionHeight*0.8f;
+				FCheckResult Hit(1.f);
+				Game->GLevel->SingleLineCheck( Hit, C, Body, Eye, TRACE_VisBlocking );
+				debugf( NAME_Log, "AIPROBE trace: %s at (%.0f,%.0f,%.0f) -> subject at (%.0f,%.0f,%.0f): time=%.3f blocked_by=%s",
+					Near->ClassName, C->Location.X, C->Location.Y, C->Location.Z,
+					Player->Location.X, Player->Location.Y, Player->Location.Z,
+					Hit.Time, Hit.Time>=1.f ? "nothing (CLEAR)"
+						: (Hit.Actor ? Hit.Actor->GetName() : "world geometry") );
+				// And whether the subject is standing in solid space at all.
+				FCheckResult Self(1.f);
+				Game->GLevel->SingleLineCheck( Self, Player, Player->Location + FVector(0,0,4), Player->Location, TRACE_VisBlocking );
+				debugf( NAME_Log, "AIPROBE subject: zone=%i in_solid=%i",
+					(INT)Player->Region.ZoneNumber, (INT)(Self.Time<1.f) );
+			}
+		}
+	}
+	INT Moved=0, Woke=0, Hostile=0, Hurt=0, Bad=0, Alarms=0;
+	for( INT w=0; w<GAIWatch.Num(); w++ )
+	{
+		FAIWatch& W = GAIWatch(w);
+		if( W.Moved > 16.f )       Moved++;
+		if( W.StateChanges > 0 )   Woke++;
+		if( W.EverEnemy )          Hostile++;
+		if( W.MinHealth < W.StartHealth ) Hurt++;
+		if( W.EverBadLoc )         Bad++;
+		if( W.EverAlarm )          Alarms++;
+		debugf( NAME_Log, "AIPROBE %-20s %-16s state=%-16s changes=%-3i moved=%7.0f enemy=%i dist=%6.0f listens=%i sees=%i health=%.0f/%.0f sight=%.0f periph=%.2f vis=%i attitude=%i alarmtag=%-10s%s%s%s",
+			W.ClassName, W.Name,
+			*W.LastState, W.StateChanges, W.Moved, (INT)W.EverEnemy,
+			W.MinDist, (INT)W.EverProbing, (INT)W.EverLOS,
+			W.MinHealth, W.StartHealth,
+			W.SightRadius, W.PeripheralVision, W.Vis,
+			W.Attitude, W.AlarmTag[0] ? W.AlarmTag : "-",
+			W.EverAlarm ? " ALARM" : "",
+			W.Alive ? "" : " DIED",
+			W.EverBadLoc ? "  *** NON-FINITE LOCATION ***" : "" );
+	}
+	INT MoversMoved = 0;
+	for( INT m=0; m<GMovers.Num(); m++ )
+		if( GMovers(m).Moved )
+			MoversMoved++;
+	// How many creatures in this level are even capable of showing a secret.
+	INT WithAlarm = 0;
+	for( INT w=0; w<GAIWatch.Num(); w++ )
+		if( GAIWatch(w).AlarmTag[0] )
+			WithAlarm++;
+	debugf( NAME_Log, "AIPROBE: %i creature(s) carry an AlarmTag (can lead the player to a secret)", WithAlarm );
+	debugf( NAME_Log, "AIPROBE: %i creature(s) over %.1fs: %i changed state, %i acquired an enemy, %i moved, %i took damage, %i ran an alarm, %i with bad locations; movers activated %i/%i; subject health %i -> %i",
+		GAIWatch.Num(), GAIEndTime-GAIStartTime, Woke, Hostile, Moved, Hurt, Alarms, Bad,
+		MoversMoved, GMovers.Num(), GAISubjStart, GAISubjEnd );
+	unguard;
+}
+
+/*-----------------------------------------------------------------------------
 	Texture probe (-probetex).
 -----------------------------------------------------------------------------*/
 
@@ -633,6 +969,135 @@ static void RunSurfProbe( UEngine* Engine )
 			(TalFlags[t] & PF_BigWavy    ) ? " BIGWAVY" : "" );
 	}
 	debugf( NAME_Log, "SURFPROBE: %i unique (texture,flags) pairs over %i surfs", NumTally, Model->Surfs->Num() );
+	unguard;
+}
+
+/*-----------------------------------------------------------------------------
+	Fountain audit (-probefountains).
+-----------------------------------------------------------------------------*/
+
+// -probefountains answers, for a whole map and without rendering a single
+// frame, what OpenGLDrv's fountain path will make of every sheet in it: which
+// become pouring columns, which flat splash caps get absorbed into one, and
+// which candidates are left to draw as the authored pane. That last group is
+// what a stray hard-edged rectangle at a fountain always turns out to be, so
+// this is the sweep that says whether a fix holds across the game rather than
+// in the one map it was found in.
+//
+// The classification MIRRORS DrawComplexSurface (see the StreamLook block
+// there): a candidate is lit + translucent + not wavy + not auto-panning, a
+// column is one narrow enough in both horizontal axes with height to pour, and
+// a flat face joins a column it sits at. Two differences from the renderer,
+// both deliberate: the whole map is examined rather than what a camera can
+// see, and columns are registered before caps are matched, which is the steady
+// state the renderer reaches on its second frame.
+static void RunFountainProbe( UEngine* Engine )
+{
+	guard(RunFountainProbe);
+	UGameEngine* Game = Cast<UGameEngine>( Engine );
+	if( !Game || !Game->GLevel || !Game->GLevel->Model )
+	{
+		debugf( NAME_Log, "FOUNTAINS: no level" );
+		return;
+	}
+	UModel* Model = Game->GLevel->Model;
+
+	// World bounds per surface, whole and unclipped (mirrors Render's
+	// GetSurfBounds, which fills FSurfaceFacet::Bounds).
+	TArray<FBox> Bounds;
+	Bounds.Add( Model->Surfs->Num() );
+	for( INT i=0; i<Bounds.Num(); i++ )
+		Bounds(i) = FBox(0);
+	for( INT n=0; n<Model->Nodes->Num(); n++ )
+	{
+		FBspNode& Node = Model->Nodes->Element(n);
+		if( Node.NumVertices<3 || Node.iSurf<0 || Node.iSurf>=Bounds.Num() )
+			continue;
+		FBox& B = Bounds(Node.iSurf);
+		for( INT v=0; v<Node.NumVertices; v++ )
+			B += Model->Points->Element( Model->Verts->Element(Node.iVertPool+v).pVertex );
+	}
+
+	// Pass 1: register columns from the faces that can pour.
+	enum {MAX_COLS=64};
+	FBox Cols[MAX_COLS];
+	INT  NumCols=0, NumCaps=0, NumRejects=0, NumCandidates=0;
+	for( INT Pass=0; Pass<2; Pass++ )
+	{
+		for( INT i=0; i<Model->Surfs->Num(); i++ )
+		{
+			FBspSurf& Surf = Model->Surfs->Element(i);
+			if( !Bounds(i).IsValid || !Surf.Texture )
+				continue;
+			// Candidate test, as DrawComplexSurface sees it.
+			UBOOL Translucent = (Surf.PolyFlags & PF_Translucent)!=0 && !(Surf.PolyFlags & PF_Modulated);
+			UBOOL Lit         = !(Surf.PolyFlags & PF_Unlit);
+			UBOOL Wavy        = (Surf.PolyFlags & (PF_SmallWavy|PF_BigWavy))!=0;
+			// Render tags WaterTexture-class surfaces wavy before the driver
+			// ever sees them, so they are pools, never pours.
+			for( UClass* C=Surf.Texture->GetClass(); C && !Wavy; C=C->GetSuperClass() )
+				if( appStricmp( C->GetName(), "WaterTexture" )==0 )
+					Wavy = 1;
+			UBOOL Flowing = Translucent && !Wavy && (Surf.PolyFlags & (PF_AutoUPan|PF_AutoVPan))!=0;
+			if( !Translucent || !Lit || Wavy || Flowing )
+				continue;
+
+			FVector WMin = Bounds(i).Min, WMax = Bounds(i).Max;
+			FLOAT HX = WMax.X-WMin.X, HY = WMax.Y-WMin.Y, HZ = WMax.Z-WMin.Z;
+			UBOOL Narrow = Max( HX, HY ) <= 96.f;
+			if( Pass==0 )
+			{
+				if( !Narrow || HZ<=0.f )
+					continue;
+				NumCandidates++;
+				FVector FC = (WMin+WMax)*0.5f;
+				INT c;
+				for( c=0; c<NumCols; c++ )
+					if( FC.X > Cols[c].Min.X-48.f && FC.X < Cols[c].Max.X+48.f
+					 && FC.Y > Cols[c].Min.Y-48.f && FC.Y < Cols[c].Max.Y+48.f
+					 && FC.Z > Cols[c].Min.Z-48.f && FC.Z < Cols[c].Max.Z+48.f )
+						break;
+				if( c==NumCols )
+				{
+					if( NumCols==MAX_COLS )
+						continue;
+					Cols[NumCols++] = Bounds(i);
+				}
+				else Cols[c] += Bounds(i);
+				continue;
+			}
+
+			// Pass 2: everything that is not itself a pouring face.
+			if( Narrow && HZ>0.f )
+				continue;
+			NumCandidates++;
+			UBOOL Joined = 0;
+			if( Narrow && HZ<=0.f )
+			{
+				FVector FC = (WMin+WMax)*0.5f;
+				for( INT c=0; c<NumCols && !Joined; c++ )
+					if( FC.X > Cols[c].Min.X-48.f && FC.X < Cols[c].Max.X+48.f
+					 && FC.Y > Cols[c].Min.Y-48.f && FC.Y < Cols[c].Max.Y+48.f
+					 && FC.Z > Cols[c].Min.Z-48.f && FC.Z < Cols[c].Max.Z+48.f )
+						Joined = 1;
+			}
+			if( Joined )
+				NumCaps++;
+			else
+			{
+				NumRejects++;
+				debugf( NAME_Log, "FOUNTAINS   PANE %-28s box=(%7.0f,%8.0f,%7.0f)..(%7.0f,%8.0f,%7.0f) HX=%4.0f HY=%4.0f HZ=%4.0f%s",
+					Surf.Texture->GetPathName(),
+					WMin.X, WMin.Y, WMin.Z, WMax.X, WMax.Y, WMax.Z, HX, HY, HZ,
+					Narrow ? " (flat, no pour at it)" : " (too wide to be a stream)" );
+			}
+		}
+	}
+	for( INT c=0; c<NumCols; c++ )
+		debugf( NAME_Log, "FOUNTAINS COLUMN box=(%7.0f,%8.0f,%7.0f)..(%7.0f,%8.0f,%7.0f)",
+			Cols[c].Min.X, Cols[c].Min.Y, Cols[c].Min.Z, Cols[c].Max.X, Cols[c].Max.Y, Cols[c].Max.Z );
+	debugf( NAME_Log, "FOUNTAINS: columns=%i caps absorbed=%i panes left=%i (candidates=%i over %i surfs)",
+		NumCols, NumCaps, NumRejects, NumCandidates, Model->Surfs->Num() );
 	unguard;
 }
 
@@ -1003,6 +1468,155 @@ static void MainLoop( UEngine* Engine )
 			}
 		}
 
+		// -probeai: sample every creature's AI each frame while the level runs,
+		// and report at the end (see SampleAI). Runs alongside -probewalk or
+		// -probeview, so the creatures can be watched while standing still or
+		// while walking into them; -probeframes sets how long.
+		{
+			static UBOOL ProbeAI = ParseParam( appCmdLine(), "PROBEAI" );
+			static INT   AIFrames = 0, AILimit = 0;
+			if( ProbeAI )
+			{
+				if( !AILimit )
+				{
+					AILimit = 300;
+					Parse( appCmdLine(), "PROBEFRAMES=", AILimit );
+
+					// -probeaiat=<class substring> drops the player in front of
+					// the first creature of that kind. Watching a map's AI from
+					// the player start only proves the creatures tick: nothing
+					// can see the player, so nothing hunts, attacks or takes
+					// damage. Confronting one exercises the whole chain --
+					// perception, state change, pathing, combat -- and does it
+					// the same way every run, whatever the map.
+					char AtClass[64]="";
+					if( Parse( appCmdLine(), "PROBEAIAT=", AtClass, ARRAY_COUNT(AtClass) ) )
+					{
+						UGameEngine* G = Cast<UGameEngine>( Engine );
+						// The subject is any pawn the AI treats as a player --
+						// found in the level, not through a viewport, so this
+						// works on a dedicated server where the "player" is a
+						// bot and there is no client at all.
+						// Headless runs always use their OWN decoy. Some maps
+						// carry a placed player-class actor for scripted scenes;
+						// adopting one of those as the subject means auditing a
+						// pawn parked in a corner of the map that no creature
+						// will ever meet.
+						APawn* Player = NULL;
+						if( G && G->GLevel && Engine->Client )
+							for( INT i=0; i<G->GLevel->Num(); i++ )
+							{
+								APawn* P = Cast<APawn>( G->GLevel->Element(i) );
+								if( P && P->bIsPlayer && P->Health>0 )
+									{ Player = P; break; }
+							}
+						// Headless: a dedicated server has no player at all, and
+						// the deathmatch game types that do spawn bots set
+						// bNoMonsters, which destroys every creature on sight --
+						// so neither gives a level with creatures AND something
+						// for them to notice. Spawn a decoy instead: an ordinary
+						// player pawn, unpossessed. bIsPlayer is what the engine
+						// keys perception off (UnLevTic.cpp calls ShowSelf on
+						// player pawns), so creatures see, hunt and maul it
+						// exactly as they would a person -- and its health is
+						// then the proof that they did.
+						UBOOL Decoy = 0;
+						if( G && G->GLevel && !Player )
+						{
+							char DecoyClass[64]="MaleOne";
+							Parse( appCmdLine(), "PROBEAIDECOY=", DecoyClass, ARRAY_COUNT(DecoyClass) );
+							UClass* PC = FindObject<UClass>( ANY_PACKAGE, DecoyClass );
+							// Spawn on a PlayerStart, not the world origin --
+							// which is inside solid rock in most maps -- and
+							// with bNoCollisionFail so a tight spot cannot
+							// silently leave the audit with no subject at all.
+							FVector Start(0,0,0);
+							for( INT i=0; i<G->GLevel->Num(); i++ )
+							{
+								AActor* A = G->GLevel->Element(i);
+								if( A && appStrfind( const_cast<char*>(A->GetClass()->GetName()), "PlayerStart" ) )
+									{ Start = A->Location; break; }
+							}
+							if( PC )
+							{
+								Player = Cast<APawn>( G->GLevel->SpawnActor(
+									PC, NAME_None, NULL, NULL, Start, FRotator(0,0,0), NULL, 1, 1 ) );
+								Decoy = Player!=NULL;
+							}
+							debugf( NAME_Log, "AIPROBE: decoy player %s (class '%s')",
+								Decoy ? "spawned" : "FAILED", DecoyClass );
+						}
+						(void)Decoy;
+						if( G && G->GLevel && Player )
+						{
+							for( INT i=0; i<G->GLevel->Num(); i++ )
+							{
+								APawn* C = Cast<APawn>( G->GLevel->Element(i) );
+								if( !C || C->bIsPlayer )
+									continue;
+								// "any" (or a bare -probeaiat=) takes the first
+								// creature with a clear line, whatever it is --
+								// what a sweep across every map wants, since
+								// each map has a different cast. "alarm" takes
+								// the first one the mapper gave an AlarmTag,
+								// which is the only kind that can lead the
+								// player to a secret.
+								if( appStricmp( AtClass, "alarm" )==0 )
+								{
+									FName Tag = GetNameProp( C, "AlarmTag" );
+									if( Tag==NAME_None )
+										continue;
+								}
+								else if( AtClass[0] && appStricmp( AtClass, "any" )!=0
+								&&  !appStrfind( const_cast<char*>(C->GetClass()->GetName()), AtClass ) )
+									continue;
+								// Stand 220 units away ALONG THE WAY IT IS
+								// FACING: outside melee reach, well inside
+								// sight range, and inside its view cone.
+								// LineOfSightTo applies PeripheralVision to
+								// the creature's own facing, so a subject
+								// dropped at a fixed world offset lands behind
+								// half the creatures in the game and is
+								// correctly never seen -- which reads as
+								// "the AI is blind" when it is nothing of the
+								// sort.
+								FVector At = C->Location + C->Rotation.Vector()*220.f + FVector(0,0,40);
+								// And REQUIRE a clear line before settling on
+								// this creature: doors and pillars block sight
+								// legitimately, so a blocked candidate proves
+								// nothing either way. Walk on to the next one.
+								FCheckResult Hit(1.f);
+								FVector Eye = C->Location; Eye.Z += C->BaseEyeHeight;
+								G->GLevel->SingleLineCheck( Hit, C, At, Eye, TRACE_VisBlocking );
+								if( Hit.Time < 1.f )
+								{
+									debugf( NAME_Log, "AIPROBE: skipping %s '%s' -- line blocked by %s",
+										C->GetClass()->GetName(), C->GetName(),
+										Hit.Actor ? Hit.Actor->GetName() : "world geometry" );
+									continue;
+								}
+								G->GLevel->FarMoveActor( Player, At, 0, 1 );
+								Player->ViewRotation = (C->Location-Player->Location).Rotation();
+								Player->Rotation.Yaw = Player->ViewRotation.Yaw;
+								debugf( NAME_Log, "AIPROBE: placed player at (%.0f,%.0f,%.0f), facing %s '%s' at (%.0f,%.0f,%.0f)",
+									Player->Location.X, Player->Location.Y, Player->Location.Z,
+									C->GetClass()->GetName(), C->GetName(),
+									C->Location.X, C->Location.Y, C->Location.Z );
+								break;
+							}
+						}
+					}
+				}
+				SampleAI( Engine );
+				if( ++AIFrames >= AILimit )
+				{
+					ReportAI( Engine );
+					debugf( NAME_Log, "AIPROBE: done, exiting" );
+					GIsRequestingExit = 1;
+				}
+			}
+		}
+
 		char ProbeExec[128]="";
 		UBOOL HasExec = Parse( appCmdLine(), "PROBEEXEC=", ProbeExec, ARRAY_COUNT(ProbeExec) );
 		if( !ProbeWalk && (PinView || HasExec || ProbeFx) && Engine->Client )
@@ -1266,6 +1880,11 @@ int main( int argc, char** argv )
 			if( !GIsRequestingExit && ParseParam( appCmdLine(), "PROBESURFS" ) )
 			{
 				RunSurfProbe( Engine );
+				GIsRequestingExit = 1;
+			}
+			if( !GIsRequestingExit && ParseParam( appCmdLine(), "PROBEFOUNTAINS" ) )
+			{
+				RunFountainProbe( Engine );
 				GIsRequestingExit = 1;
 			}
 			if( !GIsRequestingExit && ParseParam( appCmdLine(), "PROBEANIM" ) )
