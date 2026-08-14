@@ -1597,13 +1597,12 @@ void UOpenGLRenderDevice::DrawComplexSurface( FSceneNode* Frame, FSurfaceInfo& S
 			// sheet currently on screen, so the emitter volume shrank -- and
 			// the pour vanished -- as the fountain left frame.
 			FVector WMin = Facet.Bounds.Min, WMax = Facet.Bounds.Max;
-			// A pour is narrow in BOTH horizontal axes and tall. That rules
-			// out pool surfaces (both axes large) and lit glass or force-field
-			// walls (thin one way, wide the other), view-independently.
-			FLOAT HX = WMax.X-WMin.X, HY = WMax.Y-WMin.Y;
-			if( Max( HX, HY ) <= 96.f && (WMax.Z-WMin.Z) > 0.f )
+			// A pour is narrow in BOTH horizontal axes. That rules out pool
+			// surfaces (both axes large) and lit glass or force-field walls
+			// (thin one way, wide the other), view-independently.
+			FLOAT HX = WMax.X-WMin.X, HY = WMax.Y-WMin.Y, HZ = WMax.Z-WMin.Z;
+			if( Max( HX, HY ) <= 96.f )
 			{
-				StreamLook = 1;
 				FVector FC = (WMin+WMax)*0.5f;
 				for( INT c=0; c<NumStreamCols; c++ )
 				{
@@ -1613,25 +1612,78 @@ void UOpenGLRenderDevice::DrawComplexSurface( FSceneNode* Frame, FSurfaceInfo& S
 					 && FC.Z > E.WMin.Z-48.f && FC.Z < E.WMax.Z+48.f )
 						{ Col = &E; break; }
 				}
-				if( !Col && NumStreamCols < MAX_STREAM_COLS )
+				if( HZ > 0.f )
 				{
-					Col = &StreamCols[NumStreamCols++];
-					Col->WMin = WMin;
-					Col->WMax = WMax;
-					Col->Stamp = -1;
-					Col->StampFrame = NULL;
+					// A stream face: tall enough to pour. Registers a column.
+					StreamLook = 1;
+					if( !Col && NumStreamCols < MAX_STREAM_COLS )
+					{
+						Col = &StreamCols[NumStreamCols++];
+						Col->WMin = WMin;
+						Col->WMax = WMax;
+						Col->Stamp = -1;
+						Col->StampFrame = NULL;
+					}
+					if( Col )
+					{
+						Col->WMin.X = Min( Col->WMin.X, WMin.X ); Col->WMax.X = Max( Col->WMax.X, WMax.X );
+						Col->WMin.Y = Min( Col->WMin.Y, WMin.Y ); Col->WMax.Y = Max( Col->WMax.Y, WMax.Y );
+						Col->WMin.Z = Min( Col->WMin.Z, WMin.Z ); Col->WMax.Z = Max( Col->WMax.Z, WMax.Z );
+					}
+					else StreamLook = 0;	// registry full: draw the sheet as-is
 				}
-				if( Col )
+				else if( Col )
 				{
-					Col->WMin.X = Min( Col->WMin.X, WMin.X ); Col->WMax.X = Max( Col->WMax.X, WMax.X );
-					Col->WMin.Y = Min( Col->WMin.Y, WMin.Y ); Col->WMax.Y = Max( Col->WMax.Y, WMax.Y );
-					Col->WMin.Z = Min( Col->WMin.Z, WMin.Z ); Col->WMax.Z = Max( Col->WMax.Z, WMax.Z );
+					// A FLAT face (zero height) sitting at a pour we already
+					// know about: the splash cap mappers lay in the water to
+					// hide the moment of impact. Its authored form is a hard-
+					// edged pane, and once the pour became particles it was
+					// left standing as a bright rectangle in the water at the
+					// centre of the ripples. Suppress it -- the froth and
+					// ripples play that part now.
+					//
+					// Only ever JOINS an existing column, never creates one: a
+					// small flat lit-translucent sheet on its own is as likely
+					// to be a light pool or a pane of glass lying in a frame.
+					// And it extends the column only in Z, down to the water
+					// it marks, because a cap can be much broader than the
+					// stream it belongs to -- sizing the pour off it would
+					// spread the droplets into a curtain.
+					StreamLook = 1;
+					Col->WMin.Z = Min( Col->WMin.Z, WMin.Z );
+					Col->WMax.Z = Max( Col->WMax.Z, WMax.Z );
+				}
+				if( Col && StreamLook )
+				{
 					if( Col->Stamp==FrameStamp && Col->StampFrame==(void*)Frame )
 						return;		// this column's pour is already drawn this frame
 					Col->Stamp = FrameStamp;
 					Col->StampFrame = (void*)Frame;
 				}
-				else StreamLook = 0;	// registry full: draw the sheet as-is
+			}
+			// -probefountain: report every candidate that ends up drawing as
+			// its authored self -- too wide to be a stream, or flat with no
+			// pour to belong to. A stray hard-edged pane at a fountain is
+			// always one of these (reported once per distinct box, not once
+			// per frame).
+			if( !StreamLook )
+			{
+				static UBOOL FountDbg2 = ParseParam( appCmdLine(), "PROBEFOUNTAIN" );
+				if( FountDbg2 )
+				{
+					static FVector LastMin(0,0,0), LastMax(0,0,0);
+					static INT LastStamp = -1;
+					if( WMin!=LastMin || WMax!=LastMax || FrameStamp!=LastStamp )
+					{
+						LastMin = WMin;
+						LastMax = WMax;
+						LastStamp = FrameStamp;
+						debugf( "FOUNTAIN REJECT: frame=%i tex=%ix%i box=(%.0f,%.0f,%.0f)..(%.0f,%.0f,%.0f) HX=%.0f HY=%.0f HZ=%.0f",
+							FrameStamp, Surface.Texture->USize, Surface.Texture->VSize,
+							WMin.X, WMin.Y, WMin.Z, WMax.X, WMax.Y, WMax.Z,
+							HX, HY, HZ );
+					}
+				}
 			}
 		}
 
