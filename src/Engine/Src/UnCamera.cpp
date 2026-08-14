@@ -377,7 +377,9 @@ UBOOL UViewport::Exec( const char* Cmd, FOutputDevice* Out )
 	}
 	else if( ParseCommand(&Cmd,"SHOT") )
 	{
-		// Screenshot.
+		// Screenshot. x64 port: reports the file it wrote (or why it didn't)
+		// through Out, so the console answers instead of silently succeeding --
+		// with 256 slots the failure that matters is "they are all taken".
 		char File[32];
 		for( INT i=0; i<256; i++ )
 		{
@@ -387,6 +389,7 @@ UBOOL UViewport::Exec( const char* Cmd, FOutputDevice* Out )
 		}
 		if( appFSize(File)<0 )
 		{
+			UBOOL Wrote = 0;
 			FMemMark Mark(GMem);
 			FColor* Buf = new(GMem,SizeX*SizeY)FColor;
 			RenDev->ReadPixels( Buf );
@@ -448,9 +451,15 @@ UBOOL UViewport::Exec( const char* Cmd, FOutputDevice* Out )
 
 				// Success.
 				appFclose( F );
+				Wrote = 1;
 			}
 			Mark.Pop();
+			if( Wrote )
+				Out->Logf( "Screenshot written to %s (%ix%i)", File, SizeX, SizeY );
+			else
+				Out->Logf( "Screenshot FAILED: could not write %s", File );
 		}
+		else Out->Logf( "Screenshot FAILED: Shot0000..Shot0255.bmp all exist" );
 		return 1;
 	}
 	else if( ParseCommand(&Cmd,"SHOWACTORS") )

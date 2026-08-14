@@ -12,6 +12,9 @@
 
 IMPLEMENT_CLASS(UConsole);
 
+// x64 port: how much of the screen the pulled-down console may cover.
+#define CONSOLE_MAX_FRACTION 0.25f
+
 /*------------------------------------------------------------------------------
 	Console.
 ------------------------------------------------------------------------------*/
@@ -62,6 +65,26 @@ void UConsole::WriteBinary( const void* Data, INT Length, EName ThisType )
 	unguard;
 }
 
+//
+// x64 port: an output device that forwards to the console and remembers
+// whether anything came through. Most exec handlers report only to the log,
+// so a command typed at the console produced no visible reply at all and there
+// was no way to tell "done" from "silently did nothing" -- see execConsoleCommand.
+//
+class FConsoleEcho : public FOutputDevice
+{
+public:
+	FConsoleEcho( UConsole* InConsole ) : Console(InConsole), Wrote(0) {}
+	void WriteBinary( const void* Data, INT Length, EName MsgType=NAME_None )
+	{
+		if( Length > 0 )
+			Wrote = 1;
+		Console->WriteBinary( Data, Length, MsgType );
+	}
+	UConsole*	Console;
+	UBOOL		Wrote;
+};
+
 void UConsole::execConsoleCommand( FFrame& Stack, BYTE*& Result )
 {
 	guardSlow(UConsole::execLog);
@@ -69,7 +92,16 @@ void UConsole::execConsoleCommand( FFrame& Stack, BYTE*& Result )
 	P_GET_STRING(S);
 	P_FINISH;
 
-	*(DWORD*)Result = Viewport->Exec( S, this );
+	// x64 port: always answer a typed command. Handlers that print their own
+	// result (stat readouts, the screenshot's filename) are left to speak for
+	// themselves; the rest get a plain acknowledgement so the console confirms
+	// the command ran. Failures stay with the script, which prints the
+	// localized "unrecognized command" -- echoing here too would double it.
+	FConsoleEcho Echo( this );
+	UBOOL Ok = Viewport->Exec( S, &Echo );
+	if( Ok && !Echo.Wrote )
+		Echo.Logf( "%s: ok", S );
+	*(DWORD*)Result = Ok;
 
 	unguardexecSlow;
 }
@@ -104,8 +136,16 @@ void UConsole::PreRender( FSceneNode* Frame )
 	// Compute sizing of all visible status bar components.
 	if( ConsolePos > 0.0 )
 	{
-		// Show console.
-		ConsoleLines = Min(ConsolePos * (FLOAT)Frame->Y, (FLOAT)Frame->Y);
+		// Show console. x64 port: capped at a quarter of the screen. The script
+		// slides ConsolePos to its own target (0.9 in the shipped Engine.u),
+		// which buries all but a strip of the game under the panel -- useless
+		// when the console is being used to look AT something, e.g. typing
+		// "shot" to photograph an artifact. Capping the pixel height here
+		// rather than editing the script keeps this working with the retail
+		// Engine.u, which is not rebuilt from source: the panel simply stops
+		// growing a quarter of the way down, and the text, which is laid out
+		// upward from the panel's bottom edge, follows it.
+		ConsoleLines = Min(ConsolePos * (FLOAT)Frame->Y, CONSOLE_MAX_FRACTION * (FLOAT)Frame->Y);
 		Frame->Y -= ConsoleLines;
 	}
 	if( BorderSize>=2 )
