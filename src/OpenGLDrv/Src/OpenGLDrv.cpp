@@ -76,6 +76,10 @@
 #ifndef GL_CLAMP_TO_EDGE
 #define GL_CLAMP_TO_EDGE                  0x812F
 #endif
+#ifndef GL_TEXTURE_MAX_ANISOTROPY_EXT
+#define GL_TEXTURE_MAX_ANISOTROPY_EXT     0x84FE
+#define GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT 0x84FF
+#endif
 #ifndef GL_TEXTURE_LOD_BIAS
 #define GL_TEXTURE_LOD_BIAS               0x8501
 #endif
@@ -114,6 +118,28 @@ class DLL_EXPORT UOpenGLRenderDevice : public URenderDevice
 
 	// Configuration.
 	UBOOL			UseVSync;
+	// Anisotropic filtering. A wall or floor running away from the camera is
+	// sampled over a pixel footprint that is long in one texture axis and
+	// narrow in the other, and plain trilinear must pick ONE mip for both --
+	// so it picks for the long axis and throws away the detail the short axis
+	// still had. That is why a corridor floor dissolves into mush a few metres
+	// out while the same texture is crisp underfoot. Config; 0 or 1 disables.
+	INT				MaxAnisotropy;
+	FLOAT			AnisotropyLimit;	// what the hardware actually allows (0 = unsupported)
+	// Mip selection bias for every texture. This is what retail Glide's
+	// DetailBias actually was -- despite the name it was a global
+	// grTexLodBiasValue applied to all TMUs at init (UnGlide.cpp), shipped at
+	// -1.5. Negative sharpens by biasing toward the higher-resolution mip, at
+	// the cost of shimmer on minified surfaces.
+	FLOAT			LodBias;
+	// Detail textures: the high-frequency overlay that gives a surface bite
+	// close up, where the 256x256 base texture has run out of texels.
+	// DetailRange is Glide's NearZ, a hardcoded 200 units there. DetailBias is
+	// ours, not retail's: an extra bias for the overlay alone, since it is
+	// high-frequency by design and is what the eye reads as sharpness.
+	UBOOL			DetailTextures;
+	FLOAT			DetailRange;
+	FLOAT			DetailBias;
 
 	// Screen brightness (x64 port): the video-menu Brightness slider (UClient::
 	// Brightness, 0..1, 0.5=neutral) is baked into texture colors at upload via a
@@ -284,6 +310,7 @@ class DLL_EXPORT UOpenGLRenderDevice : public URenderDevice
 	void UploadTexture( FTextureInfo& Info, DWORD PolyFlags, UBOOL SpriteTile );
 	void InitWavyProgram();
 	void InitUnderwaterProgram();
+	void QueryAnisotropy();
 	FLOAT EyeX( FSceneNode* Frame, FLOAT ScreenX, FLOAT Z ) { return (ScreenX - Frame->FX2) * Z / Frame->Proj.Z; }
 	FLOAT EyeY( FSceneNode* Frame, FLOAT ScreenY, FLOAT Z ) { return (ScreenY - Frame->FY2) * Z / Frame->Proj.Z; }
 };
@@ -406,6 +433,26 @@ static GLuint ZBuildFragmentProgram( const char* Src, const char* What )
 	unguard;
 }
 
+// Anisotropic filtering has been core-adjacent since 1999 (EXT_texture_filter_
+// anisotropic) and every driver this port will meet has it, but ask rather than
+// assume: an unsupported enum would otherwise raise a GL error on every texture
+// bind. AnisotropyLimit stays 0 when unavailable and the filter is skipped.
+void UOpenGLRenderDevice::QueryAnisotropy()
+{
+	guard(UOpenGLRenderDevice::QueryAnisotropy);
+	AnisotropyLimit = 0.f;
+	const char* Ext = (const char*)glGetString( GL_EXTENSIONS );
+	if( Ext && appStrfind( const_cast<char*>(Ext), "GL_EXT_texture_filter_anisotropic" ) )
+	{
+		GLfloat Max = 0.f;
+		glGetFloatv( GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT, &Max );
+		AnisotropyLimit = Max;
+	}
+	debugf( NAME_Init, "OpenGL anisotropy: hardware max %.0fx, using %.0fx",
+		AnisotropyLimit, AnisotropyLimit>0.f ? Min( (FLOAT)MaxAnisotropy, AnisotropyLimit ) : 1.f );
+	unguard;
+}
+
 /*-----------------------------------------------------------------------------
 	Construction and registration.
 -----------------------------------------------------------------------------*/
@@ -414,6 +461,12 @@ UOpenGLRenderDevice::UOpenGLRenderDevice()
 {
 	guard(UOpenGLRenderDevice::UOpenGLRenderDevice);
 	UseVSync         = 1;
+	MaxAnisotropy    = 16;
+	AnisotropyLimit  = 0.f;
+	LodBias          = -0.5f;
+	DetailTextures   = 1;
+	DetailRange      = 200.f;	// retail Glide's NearZ
+	DetailBias       = -0.5f;
 #if UNREAL_USE_SDL
 	SdlWindow        = NULL;
 	SdlContext       = NULL;
@@ -484,6 +537,11 @@ void UOpenGLRenderDevice::InternalClassInitializer( UClass* Class )
 	if( appStricmp( Class->GetName(), "OpenGLRenderDevice" )==0 )
 	{
 		new(Class,"UseVSync", RF_Public)UBoolProperty( CPP_PROPERTY(UseVSync), "Options", CPF_Config );
+		new(Class,"MaxAnisotropy", RF_Public)UIntProperty( CPP_PROPERTY(MaxAnisotropy), "Options", CPF_Config );
+		new(Class,"LodBias", RF_Public)UFloatProperty( CPP_PROPERTY(LodBias), "Options", CPF_Config );
+		new(Class,"DetailTextures", RF_Public)UBoolProperty( CPP_PROPERTY(DetailTextures), "Options", CPF_Config );
+		new(Class,"DetailRange", RF_Public)UFloatProperty( CPP_PROPERTY(DetailRange), "Options", CPF_Config );
+		new(Class,"DetailBias", RF_Public)UFloatProperty( CPP_PROPERTY(DetailBias), "Options", CPF_Config );
 	}
 	unguard;
 }
@@ -531,6 +589,7 @@ UBOOL UOpenGLRenderDevice::Init( UViewport* InViewport )
 	debugf( NAME_Init, "OpenGL vendor    : %s", (const char*)glGetString(GL_VENDOR)   );
 	debugf( NAME_Init, "OpenGL renderer  : %s", (const char*)glGetString(GL_RENDERER) );
 	debugf( NAME_Init, "OpenGL version   : %s", (const char*)glGetString(GL_VERSION)  );
+	QueryAnisotropy();
 
 	SDL_GL_SetSwapInterval( UseVSync ? 1 : 0 );
 #else
@@ -594,6 +653,7 @@ UBOOL UOpenGLRenderDevice::Init( UViewport* InViewport )
 	debugf( NAME_Init, "OpenGL vendor    : %s", (const char*)glGetString(GL_VENDOR)   );
 	debugf( NAME_Init, "OpenGL renderer  : %s", (const char*)glGetString(GL_RENDERER) );
 	debugf( NAME_Init, "OpenGL version   : %s", (const char*)glGetString(GL_VERSION)  );
+	QueryAnisotropy();
 
 	// VSync.
 	PFNWGLSWAPINTERVALEXT wglSwapIntervalEXT
@@ -1166,9 +1226,18 @@ void UOpenGLRenderDevice::SetTexture( FTextureInfo& Info, DWORD PolyFlags, UBOOL
 		glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, Clamp ? GL_CLAMP_TO_EDGE : GL_REPEAT );
 		glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, Clamp ? GL_CLAMP_TO_EDGE : GL_REPEAT );
 		// x64 port: retail GlideDrv sharpened mip selection via grTexLodBiasValue
-		// with shipped DetailBias=-1.5 (UnGlide.cpp TryRes + Default.ini). -0.5
-		// gives comparable bite under trilinear without 4K mip shimmer.
-		glTexParameterf( GL_TEXTURE_2D, GL_TEXTURE_LOD_BIAS, -0.5f );
+		// (UnGlide.cpp, its misleadingly named DetailBias, shipped at -1.5).
+		// The default here is gentler because trilinear at 4K shimmers where
+		// 640x480 did not; LodBias reopens the retail value to anyone who
+		// wants it.
+		// (::Clamp -- SetTexture's own Clamp parameter shadows the global.)
+		glTexParameterf( GL_TEXTURE_2D, GL_TEXTURE_LOD_BIAS, ::Clamp( LodBias, -3.f, 3.f ) );
+		// Anisotropy, for the mipmapped world textures only: sprite tiles are
+		// mip-0 single-level uploads with nothing for it to do, and unfiltered
+		// (PF_NoSmooth) surfaces are asking for the crunchy look on purpose.
+		if( AnisotropyLimit > 1.f && Info.NumMips>1 && !SpriteTile && Smooth )
+			glTexParameterf( GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY_EXT,
+				Min( (FLOAT)MaxAnisotropy, AnisotropyLimit ) );
 	}
 	unguard;
 }
@@ -2179,15 +2248,19 @@ void UOpenGLRenderDevice::DrawComplexSurface( FSceneNode* Frame, FSurfaceInfo& S
 	// the whole pass is 2x-modulated — so far surfaces multiply by ~1.0 (no-op)
 	// while near surfaces get the detail. (DetailTexture was nulled above when a
 	// fog map is present, so the two are mutually exclusive as in the original.)
-	if( Surface.DetailTexture )
+	if( Surface.DetailTexture && DetailTextures )
 	{
 		DetailCount++;
-		const FLOAT NearZ = 200.f;
+		const FLOAT NearZ = Max( 1.f, DetailRange );
 		glDisable( GL_ALPHA_TEST );
 		glEnable( GL_BLEND );
 		glBlendFunc( GL_DST_COLOR, GL_SRC_COLOR );	// 2x modulate
 		SetTexture( *Surface.DetailTexture, 0, 0 );	// Clamp=0: detail texture tiles
 		CurrentBlendFlags = (DWORD)-1;
+		// The overlay gets its own bias on top of the shared one SetTexture
+		// just applied: it is pure high-frequency noise, so biasing it sharper
+		// costs none of the base texture's stability.
+		glTexParameterf( GL_TEXTURE_2D, GL_TEXTURE_LOD_BIAS, Clamp( DetailBias, -3.f, 3.f ) );
 		glTexEnvi( GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_COMBINE );
 		glTexEnvi( GL_TEXTURE_ENV, GL_COMBINE_RGB, GL_INTERPOLATE );
 		glTexEnvi( GL_TEXTURE_ENV, GL_SOURCE0_RGB, GL_TEXTURE );			glTexEnvi( GL_TEXTURE_ENV, GL_OPERAND0_RGB, GL_SRC_COLOR );
@@ -2195,12 +2268,40 @@ void UOpenGLRenderDevice::DrawComplexSurface( FSceneNode* Frame, FSurfaceInfo& S
 		glTexEnvi( GL_TEXTURE_ENV, GL_SOURCE2_RGB, GL_PRIMARY_COLOR );	glTexEnvi( GL_TEXTURE_ENV, GL_OPERAND2_RGB, GL_SRC_ALPHA );
 		FLOAT Gray[4] = { 0.5f, 0.5f, 0.5f, 1.f };
 		glTexEnvfv( GL_TEXTURE_ENV, GL_TEXTURE_ENV_COLOR, Gray );
+		// CLIP each polygon to the near band before drawing it, exactly as
+		// retail Glide does (UnGlide.cpp, same NearZ and the same alpha ramp).
+		// This is not an optimization -- it is what makes the pass work at all.
+		// The fade is a per-VERTEX alpha, and BSP surfaces are large: a floor
+		// polygon's vertices sit at the far corners of the room, all of them
+		// past NearZ and so all of them at alpha 0, which left the whole
+		// polygon undetailed even where it ran directly beneath the camera.
+		// Clipping introduces vertices ON the boundary, so the near part of a
+		// big surface gets the alpha ramp it should always have had.
 		for( FSavedPoly* Poly=Facet.Polys; Poly; Poly=Poly->Next )
 		{
-			glBegin( GL_TRIANGLE_FAN );
-			for( INT i=0; i<Poly->NumPts; i++ )
+			enum {MAX_CLIP=34};
+			FVector Clipped[MAX_CLIP];
+			INT NumClipped = 0;
+			for( INT i=0, j=Poly->NumPts-1; i<Poly->NumPts && NumClipped<MAX_CLIP-1; j=i++ )
 			{
-				FVector& P = Poly->Pts[i]->Point;
+				const FVector& Pi = Poly->Pts[i]->Point;
+				const FVector& Pj = Poly->Pts[j]->Point;
+				UBOOL NearI = Pi.Z < NearZ, NearJ = Pj.Z < NearZ;
+				// Edge crosses the boundary: emit the crossing point. Straight
+				// edge, so interpolating the eye-space position is exact, and
+				// the mapping below is affine in position -- no need to carry
+				// UVs through the clip.
+				if( NearI != NearJ && Abs(Pi.Z-Pj.Z) > 0.0001f )
+					Clipped[NumClipped++] = Pi + (Pj-Pi)*((NearZ-Pi.Z)/(Pj.Z-Pi.Z));
+				if( NearI )
+					Clipped[NumClipped++] = Pi;
+			}
+			if( NumClipped < 3 )
+				continue;	// nothing of this polygon is near enough to detail
+			glBegin( GL_TRIANGLE_FAN );
+			for( INT i=0; i<NumClipped; i++ )
+			{
+				const FVector& P = Clipped[i];
 				FLOAT U = Facet.MapCoords.XAxis | (P - Facet.MapCoords.Origin);
 				FLOAT V = Facet.MapCoords.YAxis | (P - Facet.MapCoords.Origin);
 				FLOAT A = P.Z>0.f ? Clamp( 100.f*(NearZ/P.Z - 1.f)/255.f, 0.f, 1.f ) : 0.f;
@@ -2210,7 +2311,11 @@ void UOpenGLRenderDevice::DrawComplexSurface( FSceneNode* Frame, FSurfaceInfo& S
 			}
 			glEnd();
 		}
-		// Restore the default modulate env mode for later passes/primitives.
+		// Restore the shared mip bias and the default modulate env mode for
+		// later passes/primitives -- the bias is a per-texture-object
+		// parameter and would otherwise persist if this texture were ever
+		// bound as something other than a detail overlay.
+		glTexParameterf( GL_TEXTURE_2D, GL_TEXTURE_LOD_BIAS, Clamp( LodBias, -3.f, 3.f ) );
 		glTexEnvi( GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE );
 		glColor3f( 1.f, 1.f, 1.f );
 	}
