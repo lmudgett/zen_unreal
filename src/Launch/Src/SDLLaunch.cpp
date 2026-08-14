@@ -1459,6 +1459,17 @@ static void MainLoop( UEngine* Engine )
 				if( ( FrameNum % 25 )==0 || FrameNum==ProbeFrames-1 )
 					debugf( NAME_Log, "PROBEWALK: frame %3i at (%.0f,%.0f,%.0f)", FrameNum, P->Location.X, P->Location.Y, P->Location.Z );
 			}
+			// -probeshotevery=N applies here too, not just to the pinned view:
+			// a walked sequence of consecutive frames is what shows temporal
+			// behaviour -- mip shimmer, texture animation, anything that only
+			// misbehaves while the camera moves. A still cannot show any of it.
+			{
+				INT WalkShotEvery = 0;
+				Parse( appCmdLine(), "PROBESHOTEVERY=", WalkShotEvery );
+				if( WalkShotEvery > 0 && FrameNum >= ProbeFrames/2 && (FrameNum % WalkShotEvery)==0 )
+					for( INT v=0; v<Engine->Client->Viewports.Num(); v++ )
+						Engine->Client->Viewports(v)->Exec( "SHOT", GSystem );
+			}
 			if( ++FrameNum >= ProbeFrames )
 			{
 				for( INT v=0; v<Engine->Client->Viewports.Num(); v++ )
