@@ -13,7 +13,30 @@ var localized string[16] MonthNames[12];
 function BeginPlay()
 {
 	Super.BeginPlay();
+	// x64 port: re-read the slot list from the ini. These are config values,
+	// which are filled into the class defaults once at startup; a menu is
+	// spawned fresh every time it is opened and copies those defaults, so
+	// without this it shows the names as they were when the game launched --
+	// save a game and the Load menu still lists the one before it.
+	LoadConfig();
+	RecoverOrphanedSlots();
 	BuildSlotOrder();
+}
+
+// x64 port: a slot's NAME lives in the ini while the save itself is a file in
+// SavePath, and the two can come apart -- the ini is rewritten on every run and
+// a session that started with a stale copy of the list writes that copy back.
+// When it happens the saves are still on disk but there is no way to reach
+// them, because loading is only ever driven from this menu. So trust the disk:
+// any slot with a file but no name gets a placeholder, which makes it visible
+// and loadable. Names are not invented for slots with no file.
+function RecoverOrphanedSlots()
+{
+	local int i;
+
+	For ( i=0; i<9; i++ )
+		if ( (SlotNames[i] ~= "..Empty..") && SaveSlotExists(i) )
+			SlotNames[i] = "Saved Game " $ string(i);
 }
 
 // Effective ordering stamp for a slot: the recorded SaveTimes when present,

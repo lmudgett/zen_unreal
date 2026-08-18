@@ -85,6 +85,41 @@ void UGameEngine::Init()
 	// Delete temporary files in cache.
 	appCleanFileCache();
 
+	// x64 port: reconcile the save-slot NAME list against the saves that are
+	// actually on disk. The names live in the ini while the saves are files in
+	// SavePath, and the two come apart: the ini is rewritten on every run, so a
+	// session that started with a stale or blank list writes that list back over
+	// a good one. When it happens every .usa is still there but nothing can
+	// reach it -- loading is only ever driven from the save menu, and the menu
+	// lists names, not files. Repair the list here, at startup, before anything
+	// reads it, so the fix is stored rather than merely displayed.
+	//
+	// Only ever ADDS a placeholder for a slot that has a file but no name; a
+	// real name is never overwritten and a nameless empty slot is left alone.
+	// See UnrealSlotMenu.RecoverOrphanedSlots for the same rule applied at the
+	// point of display, for the case where the ini cannot be written.
+	{
+		INT Recovered = 0;
+		for( INT Slot=0; Slot<9; Slot++ )
+		{
+			char Filename[256], Value[1024]="";
+			appSprintf( Filename, "%s\\Save%i.usa", GSys->SavePath, Slot );
+			if( appFSize( Filename ) <= 0 )
+				continue;
+			char Key[64];
+			appSprintf( Key, "SlotNames[%i]", Slot );
+			UBOOL Have = GetConfigString( "UnrealI.UnrealSlotMenu", Key, Value, ARRAY_COUNT(Value) );
+			if( Have && Value[0] && appStricmp( Value, "..Empty.." )!=0 )
+				continue;
+			char Name[64];
+			appSprintf( Name, "Saved Game %i", Slot );
+			SetConfigString( "UnrealI.UnrealSlotMenu", Key, Name );
+			Recovered++;
+		}
+		if( Recovered )
+			debugf( NAME_Log, "SaveSlots: %i save file(s) had no name in the ini; listed as placeholders so they can be loaded", Recovered );
+	}
+
 	// If not a dedicated server.
 	if( GIsClient )
 	{	

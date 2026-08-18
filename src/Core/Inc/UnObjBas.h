@@ -824,6 +824,8 @@ public:
 	INTRINSIC(execGetPropertyText)
 	INTRINSIC(execSetPropertyText)
 	INTRINSIC(execSaveConfig)
+	INTRINSIC(execLoadConfig)
+	INTRINSIC(execSaveSlotExists)
 	INTRINSIC(execResetConfig)
 	INTRINSIC(execGetEnum)
 	INTRINSIC(execDynamicLoadObject)

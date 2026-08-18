@@ -93,7 +93,17 @@ for %%R in (msvcp140.dll msvcp140_1.dll msvcp140_2.dll vcruntime140.dll vcruntim
 )
 copy /y "System\*.u"          "dist\System\" >nul
 copy /y "System\*.int"        "dist\System\" >nul
-copy /y "System\ZenUnreal.ini" "dist\System\" >nul
+REM The ini is PLAYER STATE, not build output: it holds the save-slot names,
+REM key bindings, difficulty and video settings. Copying the source tree's copy
+REM over it silently threw all of that away -- the Load menu ended up listing
+REM saves that did not match the files in dist\Save. Seed it only when dist has
+REM none, exactly as the savegames above are treated.
+if not exist "dist\System\ZenUnreal.ini" (
+  copy /y "System\ZenUnreal.ini" "dist\System\" >nul
+  echo   seeded dist\System\ZenUnreal.ini
+) else (
+  echo   kept existing dist\System\ZenUnreal.ini ^(player settings and save names^)
+)
 if defined COPYERR ( echo. & echo ERROR: one or more System files failed to copy & exit /b 1 )
 
 echo   copying content ...

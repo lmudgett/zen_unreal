@@ -2638,6 +2638,43 @@ void UObject::execSaveConfig( FFrame& Stack, BYTE*& Result )
 }
 AUTOREGISTER_INTRINSIC( UObject, 536, execSaveConfig);
 
+// x64 port: the read side of SaveConfig, for script. Config properties are
+// filled into the class DEFAULTS once at startup and an object takes its copy
+// from there when it is created, so an object made after something else wrote
+// the ini still holds the values from load time. This re-reads them into THIS
+// object. (The Unreal menus need it: each is spawned fresh when opened, and
+// without it the save-slot list shows the names from before the last save.)
+void UObject::execLoadConfig( FFrame& Stack, BYTE*& Result )
+{
+	guard(UObject::execLoadConfig);
+	P_FINISH;
+	LoadConfig( NAME_Config );
+	unguard;
+}
+AUTOREGISTER_INTRINSIC( UObject, 547, execLoadConfig);
+
+//
+// x64 port: does a save slot actually have a file on disk? The save menus list
+// slots from a config array of NAMES, so if that array is ever lost the saves
+// themselves become unreachable through the UI even though every .usa is still
+// sitting in SavePath -- there is no other route to them, since loading is
+// driven from the menu. This lets the menu fall back on what is really there.
+//
+void UObject::execSaveSlotExists( FFrame& Stack, BYTE*& Result )
+{
+	guard(UObject::execSaveSlotExists);
+	P_GET_INT(Slot);
+	P_FINISH;
+	*(DWORD*)Result = 0;
+	if( Slot<0 || Slot>99 )
+		return;
+	char Filename[256];
+	appSprintf( Filename, "%s\\Save%i.usa", GSys->SavePath, Slot );
+	*(DWORD*)Result = appFSize( Filename ) > 0;
+	unguard;
+}
+AUTOREGISTER_INTRINSIC( UObject, 548, execSaveSlotExists);
+
 void UObject::execResetConfig( FFrame& Stack, BYTE*& Result )
 {
 	guard(UObject::execResetConfig);

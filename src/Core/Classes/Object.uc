@@ -248,6 +248,15 @@ intrinsic static final function object DynamicLoadObject( string[32] ObjectName,
 
 // Configuration.
 intrinsic(536) final function SaveConfig();
+// x64 port: the read side of SaveConfig. Config values live in the CLASS
+// DEFAULTS, which are filled once at startup, so an object spawned after
+// something else wrote the ini still carries the values from load time. Any
+// script that must see another object's saved settings needs this.
+intrinsic(547) final function LoadConfig();
+// True if SaveN.usa exists under SavePath. The save menus keep their slot
+// names in the ini, which makes a real save on disk invisible if that list is
+// ever lost; this lets them notice the file and offer it anyway.
+intrinsic(548) final function bool SaveSlotExists( int Slot );
 intrinsic(543) final function ResetConfig();
 
 //=============================================================================
