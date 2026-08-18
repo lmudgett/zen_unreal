@@ -256,6 +256,21 @@ UBOOL UEditorEngine::SafeExec( const char* InStr, FOutputDevice* Out )
 			{
 				Parse( Str, "RATE=", Seq.Rate );
 				Parse( Str, "GROUP=", Seq.Group );
+				// x64 port: REPLACE a sequence of the same name instead of
+				// appending another copy. Retail built a package once, from
+				// freshly imported meshes with empty sequence tables, so
+				// appending was safe. This port rebuilds packages from source
+				// (-make -remake=<Pkg>), which loads the EXISTING package --
+				// meshes included, sequences and all -- and re-runs every
+				// #exec, so each rebuild added a further copy of every
+				// sequence and every notify on it. UnrealI.BRifle had reached
+				// 171 sequences for the 9 the script declares, with 19 copies
+				// of the Drip notify. Removing every same-named entry first
+				// also collapses the duplicates already in a package the next
+				// time it is rebuilt.
+				for( INT i=Mesh->AnimSeqs.Num()-1; i>=0; i-- )
+					if( Mesh->AnimSeqs(i).Name==Seq.Name )
+						Mesh->AnimSeqs.Remove(i);
 				new( Mesh->AnimSeqs )FMeshAnimSeq( Seq );
 				Mesh->AnimSeqs.Shrink();
 			}
@@ -275,7 +290,20 @@ UBOOL UEditorEngine::SafeExec( const char* InStr, FOutputDevice* Out )
 			&&	Parse( Str, "FUNCTION=", Notify.Function ) )
 			{
 				FMeshAnimSeq* Seq = Mesh->GetAnimSeq( SeqName );
-				if( Seq ) new( Seq->Notifys )FMeshAnimNotify( Notify );
+				if( Seq )
+				{
+					// Idempotent for the same reason as MESH SEQUENCE above:
+					// a rebuild re-runs this directive against a sequence that
+					// already carries the notify, and a duplicate would fire
+					// the script function again at the same instant.
+					UBOOL Have = 0;
+					for( INT i=0; i<Seq->Notifys.Num(); i++ )
+						if( Seq->Notifys(i).Function==Notify.Function
+						&&  Abs(Seq->Notifys(i).Time-Notify.Time) < 0.0001f )
+							Have = 1;
+					if( !Have )
+						new( Seq->Notifys )FMeshAnimNotify( Notify );
+				}
 				else Out->Log( NAME_ExecWarning, "Unknown sequence in MESH NOTIFY" );
 			}
 			else Out->Log( NAME_ExecWarning, "Bad MESH NOTIFY" );
