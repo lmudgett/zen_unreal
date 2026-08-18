@@ -419,7 +419,12 @@ static void SDLCALL GalaxyEffectsCB( void* userdata, SDL_AudioStream* stream, in
 	// Slot*2 + bNoOverride, so Slot*2 == (Id & 14).)
 	UBOOL HasSmpl  = (S->LoopStart>=0 && S->LoopEnd>S->LoopStart);
 	UBOOL Ambient  = ((P->Id & 14)==SLOT_Ambient*2);
-	UBOOL Loops    = HasSmpl || Ambient;
+	// Looping is decided by the SLOT, never by the presence of a loop region:
+	// PlaySound is one-shot by definition, and several retail one-shots ship
+	// with a leftover smpl loop (the dispersion pistol's in-flight sound among
+	// them). Honoring those made a sound that plays once per shot repeat
+	// forever. A loop region still says WHERE an ambient repeats from.
+	UBOOL Loops    = Ambient;
 	INT   LoopBack = HasSmpl ? S->LoopStart : 0;
 	INT   LoopEnd  = HasSmpl ? Min(S->LoopEnd+1,TotalFrames) : TotalFrames;	// loopE is inclusive
 	float Buf[1024*2];
@@ -929,6 +934,16 @@ void UGalaxyAudioSubsystem::RegisterSound( USound* Sound )
 				Sample->LoopEnd   = LoopEnd;
 			}
 		}
+		// -probesounds: which sounds carry a smpl loop region. A loop region on
+		// a one-shot effect is the signature of a sound that can get stuck
+		// repeating, so this names the offenders rather than leaving it to be
+		// noticed in play.
+		static UBOOL ProbeSounds = ParseParam( appCmdLine(), "PROBESOUNDS" );
+		if( ProbeSounds && Sample->LoopStart>=0 )
+			debugf( NAME_Log, "PROBESOUND: %-40s %5i Hz %2i-bit %ich frames=%-7i LOOP %i..%i",
+				Sound->GetPathName(), Rate, Bits, Channels, FrameCount,
+				Sample->LoopStart, Sample->LoopEnd );
+
 		Sample->Pcm = (BYTE*)appMalloc( Sample->NumBytes, "GalaxyPcm" );
 		appMemcpy( Sample->Pcm, Wave.SampleDataStart, Sample->NumBytes );
 		Sound->Handle = Sample;
@@ -1033,6 +1048,17 @@ UBOOL UGalaxyAudioSubsystem::PlaySound
 	check(Radius);
 	if( !Viewport )
 		return 0;
+
+	// -probesounds: every play, with its source. A one-shot effect that an
+	// actor retriggers each tick shows up here as the same sound and actor
+	// repeating at frame rate -- which is what "the sound is stuck" sounds
+	// like, and is invisible from the script side.
+	{
+		static UBOOL ProbePlays = ParseParam( appCmdLine(), "PROBESOUNDS" );
+		if( ProbePlays && Sound )
+			debugf( NAME_Log, "PROBEPLAY: %-28s by %-20s id=%i vol=%.2f",
+				Sound->GetName(), Actor ? Actor->GetName() : "none", Id, Volume );
+	}
 
 	// Sounds with no slot get a fresh unique (negative) slot so they never
 	// interrupt each other.
@@ -1343,11 +1369,29 @@ void UGalaxyAudioSubsystem::Update( FPointRegion Region, FCoords& Coords )
 			Buffer.AudioBytes = Sample->NumBytes;
 			Buffer.pAudioData = Sample->Pcm;
 			Buffer.Flags      = XAUDIO2_END_OF_STREAM;
-			if( Sample->LoopStart>=0 && Sample->LoopEnd>Sample->LoopStart )
+			// Loop only what the ENGINE treats as looping: the ambient slot.
+			// PlaySound is one-shot by definition, and a one-shot must never be
+			// given XAUDIO2_LOOP_INFINITE -- an infinitely looping buffer never
+			// dequeues, so BuffersQueued stays 1, the finished-voice check in
+			// Update never fires, and the channel is never reclaimed. The sound
+			// then plays forever AND holds a channel. Retail content walks
+			// straight into this: several one-shots ship with a leftover smpl
+			// loop region, the dispersion pistol's in-flight sound among them,
+			// which is played once per shot -- so a handful of shots left that
+			// many voices droning and starved the effect channels.
+			//
+			// Ambients with no smpl region loop the whole buffer, which is what
+			// the ambient scan expects: it only restarts a sound it finds
+			// stopped, so a non-looping ambient would retrigger from the top
+			// forever instead of sustaining.
+			if( (Playing.Id & 14)==SLOT_Ambient*2 )
 			{
-				Buffer.LoopBegin  = Sample->LoopStart;
-				Buffer.LoopLength = Sample->LoopEnd - Sample->LoopStart;
-				Buffer.LoopCount  = XAUDIO2_LOOP_INFINITE;
+				if( Sample->LoopStart>=0 && Sample->LoopEnd>Sample->LoopStart )
+				{
+					Buffer.LoopBegin  = Sample->LoopStart;
+					Buffer.LoopLength = Sample->LoopEnd - Sample->LoopStart;
+				}
+				Buffer.LoopCount = XAUDIO2_LOOP_INFINITE;
 			}
 			Playing.Voice->SubmitSourceBuffer( &Buffer );
 			// x64 port (audit): do NOT Start yet — the per-frame parameters
@@ -1371,6 +1415,31 @@ void UGalaxyAudioSubsystem::Update( FPointRegion Region, FCoords& Coords )
 			Playing.bStarted = 1;
 		}
 #endif
+	}
+	// -probesounds: how many effect channels are in use. A one-shot that never
+	// finishes holds its channel forever, so occupancy that climbs and stays
+	// climbed -- rather than falling back toward zero once the shooting stops
+	// -- is the signature of leaked voices, and eventually of new sounds having
+	// nowhere to play.
+	{
+		static UBOOL ProbeChan = ParseParam( appCmdLine(), "PROBESOUNDS" );
+		static INT   ChanTick  = 0;
+		if( ProbeChan && ((ChanTick++) % 100)==0 )
+		{
+			// Split the count: ambients hold a channel for as long as they are
+			// in range and that is correct, so only the one-shot figure says
+			// anything about leaks.
+			INT Busy = 0, AmbientBusy = 0;
+			for( INT i=0; i<EffectsChannels; i++ )
+				if( PlayingSounds[i].Id!=0 )
+				{
+					Busy++;
+					if( (PlayingSounds[i].Id & 14)==SLOT_Ambient*2 )
+						AmbientBusy++;
+				}
+			debugf( NAME_Log, "PROBECHAN: %i/%i busy (%i ambient, %i one-shot)",
+				Busy, EffectsChannels, AmbientBusy, Busy-AmbientBusy );
+		}
 	}
 	unguard;
 
