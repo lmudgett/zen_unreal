@@ -758,9 +758,20 @@ void APawn::physWalking(FLOAT deltaTime, INT Iterations)
 				Hit.Normal = realNorm;
 			}
 			
-			if ( !bMustJump && (Hit.Time < 1.0) && (Hit.Normal.Z >= 0.7) )  
+			if ( !bMustJump && (Hit.Time < 1.0) && (Hit.Normal.Z >= 0.7) )
 			{
-				if ( (Hit.Normal.Z < 1.0) && ((Hit.Normal.Z * Region.Zone->ZoneGroundFriction) < 3.3) ) //slide down slope, depending on friction and gravity
+				// x64 port: retail slid the pawn downhill whenever
+				// Normal.Z * ZoneGroundFriction < 3.3, which at the default
+				// friction of 4 means every slope steeper than ~34 degrees --
+				// while slopes stay WALKABLE to 45 (Normal.Z >= 0.7 above). That
+				// band is incoherent: ground you can walk up spills you downhill
+				// the moment you stand still. Require the zone to actually be
+				// slippery (friction below 3.3 -- the mapper's ice knob) before
+				// the ground slides underfoot; on ordinary ground a standing
+				// pawn stays put on anything it can walk on, and faces steeper
+				// than 45 degrees never reach this branch at all.
+				if ( (Hit.Normal.Z < 1.0) && (Region.Zone->ZoneGroundFriction < 3.3)
+				  && ((Hit.Normal.Z * Region.Zone->ZoneGroundFriction) < 3.3) ) //slide down slope, depending on friction and gravity
 				{
 					FVector Slide = (deltaTime * Region.Zone->ZoneGravity/(2 * ::Max(0.5f, Region.Zone->ZoneGroundFriction))) * deltaTime;
 					Delta = Slide - Hit.Normal * (Slide | Hit.Normal);
