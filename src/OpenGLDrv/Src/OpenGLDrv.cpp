@@ -2641,15 +2641,19 @@ void UOpenGLRenderDevice::DrawComplexSurface( FSceneNode* Frame, FSurfaceInfo& S
 			ZglUniform1f( WavyLocTime, SkyCloud
 				? (FLOAT)fmod( T*0.125, 1005.3096491487338 )
 				: (FLOAT)fmod( WaterFX ? T*1.5 : T, 125.66370614359172 ) );
-			// Flowing surfaces warp gently (the pan supplies the motion);
-			// wavy pools use the tuned amplitudes; lit translucent sheets
-			// (fountain streams pouring from statues, and their kin) get a
-			// slight sway -- their procedural animation supplies the fall,
-			// the sway keeps the column from reading as a rigid slab.
-			// Cloud sheets churn WIDE -- a whole cloud's worth of texels, where
-			// water ripples a few.
+			// A lit translucent surface that is not a liquid by any other test
+			// is here for ONE reason: to have its light map folded into this
+			// pass (see FoldLight). It must not be animated at all. The old
+			// catch-all gave everything that landed here a 1.5-texel sway,
+			// meant for fountain streams pouring from statues -- but the test
+			// is just "translucent and lit", which is precisely what a pane of
+			// GLASS is, so every window in the game rippled.
+			UBOOL LitOnly = !WavyFlags && !Flowing && !SkyCloud;
+			// Flowing surfaces warp gently (the pan supplies the motion) and
+			// wavy pools use the tuned amplitudes. Cloud sheets churn WIDE -- a
+			// whole cloud's worth of texels, where water ripples a few.
 			ZglUniform1f( WavyLocAmp, SkyCloud ? 9.f : Falling ? 2.f : Flowing ? 2.5f
-				: WavyFlags ? ((Surface.PolyFlags & PF_BigWavy) ? 7.f : 3.5f) : 1.5f );
+				: WavyFlags ? ((Surface.PolyFlags & PF_BigWavy) ? 7.f : 3.5f) : 0.f );
 			ZglUniform2f( WavyLocUVMult, BaseUM, BaseVM );
 			// A fall gets no pool glint (its slope field is the strand field,
 			// not a wave) and no base fade: the strand gate below decides what
@@ -2679,7 +2683,11 @@ void UOpenGLRenderDevice::DrawComplexSurface( FSceneNode* Frame, FSurfaceInfo& S
 						Surface.MacroTexture!=NULL, Surface.FogMap!=NULL, Surface.BumpMap!=NULL );
 				}
 			}
-			ZglUniform1f( WavyLocGloss, (Falling || SkyCloud || ModDecal) ? 0.f : WaterFX ? 0.22f : 0.15f );
+			// LitOnly gets no glint either. The glint rides the same sinusoids
+			// as the warp but is NOT scaled by Amp, so zeroing the amplitude
+			// alone still left glass shimmering by +-7.5% in a travelling
+			// pattern -- the rippling would have looked half fixed.
+			ZglUniform1f( WavyLocGloss, (Falling || SkyCloud || ModDecal || LitOnly) ? 0.f : WaterFX ? 0.22f : 0.15f );
 			ZglUniform1f( WavyLocBase,  (Falling || SkyCloud || ModDecal) ? 1.f : WaterFX ? 0.88f : 1.f );
 			ZglUniform1f( WavyLocLightOn, FoldLight ? 1.f : 0.f );
 			// Ordinary surfaces: no stream shaping. (The fountain path sets
