@@ -141,6 +141,10 @@ class DLL_EXPORT UOpenGLRenderDevice : public URenderDevice
 	FLOAT			DetailRange;
 	FLOAT			DetailBias;
 
+	// (The world DISTANCE FOG that used to live here was removed at the user's
+	// call, 2026-08-18 -- retail zone fog, the mapper-flagged bFogZone kind, is
+	// still supported below. See the fog pass in DrawComplexSurface.)
+
 	// Screen brightness (x64 port): the video-menu Brightness slider (UClient::
 	// Brightness, 0..1, 0.5=neutral) is baked into texture colors at upload via a
 	// gamma LUT -- applied ONCE per texture, so it can't accumulate like a per-
@@ -174,7 +178,20 @@ class DLL_EXPORT UOpenGLRenderDevice : public URenderDevice
 	GLint			WavyLocTime, WavyLocAmp, WavyLocUVMult;
 	GLint			WavyLocGloss, WavyLocBase, WavyLocLightOn, WavyLocUEdge, WavyLocVEdge;
 	GLint			WavyLocFlowV, WavyLocScroll, WavyLocBlob, WavyLocFoam;
+	GLint			WavyLocFall, WavyLocFallDn, WavyLocFallFd, WavyLocFallSol;
 	UBOOL			WavyTried;
+
+	// Sky box (see SetSceneNode). The sky is DRAWN exactly as stock; the flag
+	// exists for the one sky treatment that survived -- the CLOUD CHURN in
+	// DrawComplexSurface -- and for ClearZ ordering.
+	// (Several attempts at treating the sky box's own seams -- aerial
+	// perspective, a haze band, an atmospheric horizon, a screen-space blur --
+	// were backed out: every one traded the seams for a worse artifact, because
+	// the discontinuity is in the ARTWORK. Three unrelated paintings meet along
+	// the box's edges, and no post-process can invent the transition between
+	// them. The fix other engines use is to stop rasterising a box at all -- a
+	// dome, or a cube map sampled by view direction, which has no edge to show.)
+	UBOOL			SkyFrame;			// the scene node being drawn is a sky box
 
 	// Fountain columns (see DrawComplexSurface). A pour is authored as several
 	// translucent sheets -- crossed, or the four walls of a box -- and the
@@ -221,7 +238,7 @@ class DLL_EXPORT UOpenGLRenderDevice : public URenderDevice
 	// Editor hit testing (Phase 5). While a hit-test Draw is locked, pushed
 	// proxy blobs accumulate on HitStack; any primitive that covers the
 	// viewport's 5px hit region sets HitCovered, and the innermost enclosing
-	// PopHit snapshots the whole stack as the winner (painter's order — later
+	// PopHit snapshots the whole stack as the winner (painter's order ??? later
 	// covered proxies overwrite earlier ones). Unlock writes the winner back
 	// to the caller's buffer. See UViewport::ExecuteHits for the consumer.
 	BYTE*			HitDataPtr;			// caller's buffer (NULL = not hit testing)
@@ -309,6 +326,8 @@ class DLL_EXPORT UOpenGLRenderDevice : public URenderDevice
 	void SetTexture( FTextureInfo& Info, DWORD PolyFlags, UBOOL Clamp );
 	void UploadTexture( FTextureInfo& Info, DWORD PolyFlags, UBOOL SpriteTile );
 	void InitWavyProgram();
+	void DrawFallFoot( FSceneNode* Frame, FSurfaceInfo& Surface, FSurfaceFacet& Facet,
+		DOUBLE T, FLOAT BaseUM, FLOAT BaseVM, UBOOL FoldLight, FLOAT LightUM, FLOAT LightVM );
 	void InitUnderwaterProgram();
 	void QueryAnisotropy();
 	FLOAT EyeX( FSceneNode* Frame, FLOAT ScreenX, FLOAT Z ) { return (ScreenX - Frame->FX2) * Z / Frame->Proj.Z; }
@@ -340,6 +359,7 @@ typedef GLint  (APIENTRY *ZPFNGLGETUNIFORMLOCATION)( GLuint, const char* );
 typedef void   (APIENTRY *ZPFNGLUNIFORM1F)( GLint, GLfloat );
 typedef void   (APIENTRY *ZPFNGLUNIFORM1I)( GLint, GLint );
 typedef void   (APIENTRY *ZPFNGLUNIFORM2F)( GLint, GLfloat, GLfloat );
+typedef void   (APIENTRY *ZPFNGLUNIFORM3F)( GLint, GLfloat, GLfloat, GLfloat );
 typedef void   (APIENTRY *ZPFNGLACTIVETEXTURE)( GLenum );
 typedef void   (APIENTRY *ZPFNGLMULTITEXCOORD2F)( GLenum, GLfloat, GLfloat );
 #ifndef GL_FRAGMENT_SHADER
@@ -360,6 +380,7 @@ static ZPFNGLUSEPROGRAM         ZglUseProgram;
 static ZPFNGLUNIFORM1F          ZglUniform1f;
 static ZPFNGLUNIFORM1I          ZglUniform1i;
 static ZPFNGLUNIFORM2F          ZglUniform2f;
+static ZPFNGLUNIFORM3F          ZglUniform3f;
 static ZPFNGLGETUNIFORMLOCATION ZglGetUniformLocation;
 static ZPFNGLACTIVETEXTURE      ZglActiveTexture;
 static ZPFNGLMULTITEXCOORD2F    ZglMultiTexCoord2f;
@@ -394,13 +415,14 @@ static GLuint ZBuildFragmentProgram( const char* Src, const char* What )
 	ZglUniform1f  = (ZPFNGLUNIFORM1F) ZGLProc("glUniform1f");
 	ZglUniform1i  = Uniform1i;
 	ZglUniform2f  = (ZPFNGLUNIFORM2F) ZGLProc("glUniform2f");
+	ZglUniform3f  = (ZPFNGLUNIFORM3F) ZGLProc("glUniform3f");
 	// Multitexture (core since GL 1.3), used to fold the light map into the
 	// translucent base pass. Optional: callers must null-check before use.
 	ZglActiveTexture   = (ZPFNGLACTIVETEXTURE)  ZGLProc("glActiveTexture");
 	ZglMultiTexCoord2f = (ZPFNGLMULTITEXCOORD2F)ZGLProc("glMultiTexCoord2f");
 	if( !CreateShader || !ShaderSource || !CompileShader || !GetShaderiv || !CreateProgram
 	 || !AttachShader || !LinkProgram || !GetProgramiv || !ZglGetUniformLocation || !Uniform1i
-	 || !ZglUseProgram || !ZglUniform1f || !ZglUniform2f )
+	 || !ZglUseProgram || !ZglUniform1f || !ZglUniform2f || !ZglUniform3f )
 	{
 		debugf( NAME_Init, "OpenGL: no shader support, %s disabled", What );
 		return 0;
@@ -492,7 +514,12 @@ UOpenGLRenderDevice::UOpenGLRenderDevice()
 	WavyLocScroll    = -1;
 	WavyLocBlob      = -1;
 	WavyLocFoam      = -1;
+	WavyLocFall      = -1;
+	WavyLocFallDn    = -1;
+	WavyLocFallFd    = -1;
+	WavyLocFallSol   = -1;
 	WavyTried        = 0;
+	SkyFrame         = 0;
 	NumStreamCols    = 0;
 	FrameStamp       = 0;
 	UnderwaterProgram= 0;
@@ -753,7 +780,7 @@ void UOpenGLRenderDevice::Lock( FPlane InFlashScale, FPlane InFlashFog, FPlane S
 {
 	guard(UOpenGLRenderDevice::Lock);
 
-	// x64 port: -framestats — the first GL calls of the frame absorb the
+	// x64 port: -framestats ??? the first GL calls of the frame absorb the
 	// driver's present back-pressure (vsync wait); time them separately.
 	static UBOOL Checked = 0;
 	if( !Checked ) { Checked = 1; GLStats = ParseParam( appCmdLine(), "FRAMESTATS" ); }
@@ -845,7 +872,7 @@ void UOpenGLRenderDevice::Unlock( UBOOL Blit )
 		if( GGLPostRenderHook )
 			(*GGLPostRenderHook)( Viewport );
 
-		// x64 port: -framestats — time the present separately from the frame.
+		// x64 port: -framestats ??? time the present separately from the frame.
 		static UBOOL FrameStats = ParseParam( appCmdLine(), "FRAMESTATS" );
 		if( FrameStats )
 		{
@@ -855,7 +882,7 @@ void UOpenGLRenderDevice::Unlock( UBOOL Blit )
 #else
 			SwapBuffers( hDC );
 #endif
-			glFinish(); // x64 port: sync the frame boundary — see non-stats path below
+			glFinish(); // x64 port: sync the frame boundary ??? see non-stats path below
 			DOUBLE T1 = appSeconds();
 			if( T1-T0 > 0.010 )
 				debugf( "FrameStats: SwapBuffers took %.1fms", (T1-T0)*1000.0 );
@@ -1018,7 +1045,7 @@ void UOpenGLRenderDevice::SetSceneNode( FSceneNode* Frame )
 	glViewport( Frame->XB, Viewport->SizeY - Frame->Y - Frame->YB, Frame->X, Frame->Y );
 
 	// Rebuild the engine's projection: ScreenX = Point.X * Proj.Z / Point.Z + FX/2.
-	// x64 port: zNear must be below 1.0 — the canvas draws tiles/fonts at
+	// x64 port: zNear must be below 1.0 ??? the canvas draws tiles/fonts at
 	// Z=1.0 exactly, and vertices on the near plane get clipped by floating-
 	// point rounding (the whole 2D overlay vanished at zNear=1). The frustum
 	// edges are specified at zNear, so the field of view is unaffected.
@@ -1036,9 +1063,19 @@ void UOpenGLRenderDevice::SetSceneNode( FSceneNode* Frame )
 	glLoadIdentity();
 	glScalef( 1.f, -1.f, -1.f );
 
+	// Is this scene node the SKY BOX? Render draws it as a child frame whose
+	// zone is the sky zone (see the PF_FakeBackdrop portal in UnRender), which
+	// is what distinguishes it from the other child frames -- a mirror or a
+	// warp zone reaches us the same way. Same test Render itself uses to know
+	// when to clear Z after a sky.
+	SkyFrame = 0;
+	if( Frame->Parent && Frame->Level && Frame->Level->Model
+	 && Frame->Level->Model->Nodes && Frame->ZoneNumber>=0 && Frame->ZoneNumber<64 )
+		SkyFrame = Cast<ASkyZoneInfo>( Frame->Level->Model->Nodes->Zones[Frame->ZoneNumber].ZoneActor ) != NULL;
+
 	// Resolve the viewer's zone distance fog (bFogZone + FogColor + FogDistance).
 	// Verts reach us in Unreal eye space, so Point.Z is the view depth in the
-	// same world units as FogDistance — no remapping needed.
+	// same world units as FogDistance ??? no remapping needed.
 	FogActive = 0;
 	AZoneInfo* Zone = ( Frame->Viewport && Frame->Viewport->Actor )
 		? Frame->Viewport->Actor->Region.Zone : NULL;
@@ -1125,9 +1162,43 @@ void UOpenGLRenderDevice::SetBlend( DWORD PolyFlags )
 	// drawn later and farther -- the distance-dependent square hole punched
 	// through enemies standing in front of torch flames at 4K.
 	if( (PolyFlags & (PF_Translucent|PF_Modulated)) && !(PolyFlags & PF_Occlude) )
+	{
 		glDepthMask( GL_FALSE );
+
+		// x64 port: these are the map's DECALS -- ripple rings, scorch marks,
+		// mist sheets -- and mappers lay them a unit or two above the surface
+		// they decorate, trusting the BSP sort to order them. The depth buffer
+		// does not have a unit to spare at range: with zNear 0.5 and zFar 49152
+		// a 24-bit buffer resolves about d*d/8.4e6 world units, so 1 unit stops
+		// being representable past ~2900 and the decal starts winning and losing
+		// the test pixel by pixel. NyLeve's HubEffects.WaterRings2 sits exactly
+		// 1 unit over the lake; stand at the TOP of the big fall (the save spot)
+		// and the lake is ~5400 away, where the quantum is ~3.5 units, and the
+		// decal breaks into 1-pixel horizontal dashes.
+		//
+		// It shows up only at high resolution -- at 800x600 the same view is
+		// clean, which is why this took two passes to pin down. Always reproduce
+		// a rasterisation complaint at the reporter's RESOLUTION.
+		//
+		// Bias them toward the viewer. They do not write depth (just above), so
+		// nothing drawn later can inherit the bias. Masked surfaces are excluded:
+		// their later passes re-draw the same geometry under glDepthFunc(GL_EQUAL)
+		// (see DrawComplexSurface), which an offset would make match nothing. The
+		// slope term does most of the work here -- the lake is near edge-on from
+		// up there, which is exactly where depth quantisation is worst.
+		if( !(PolyFlags & PF_Masked) )
+		{
+			glEnable( GL_POLYGON_OFFSET_FILL );
+			glPolygonOffset( -1.f, -4.f );
+		}
+		else
+			glDisable( GL_POLYGON_OFFSET_FILL );
+	}
 	else
+	{
 		glDepthMask( GL_TRUE );
+		glDisable( GL_POLYGON_OFFSET_FILL );
+	}
 	unguard;
 }
 
@@ -1151,6 +1222,11 @@ void UOpenGLRenderDevice::SetTexture( FTextureInfo& Info, DWORD PolyFlags, UBOOL
 	// so they too need their own cache entry.
 	if( (PolyFlags & PF_Translucent) && !(PolyFlags & PF_Modulated) )
 		TestID |= (QWORD)16;
+	// Modulated uploads skip the gamma bake entirely (see UploadTexture), so
+	// they need their own entry too -- the same texture drawn unmodulated
+	// somewhere else would otherwise hand them its gamma-baked texels.
+	if( PolyFlags & PF_Modulated )
+		TestID |= (QWORD)64;
 	// Translucent and modulated WORLD-SPRITE tiles (smoke, fireballs, flame
 	// sprites -- they alone carry PF_TwoSided, added by DrawActorSprite; UI
 	// tiles and coronas don't) get a dedicated upload variant, sampled from
@@ -1184,7 +1260,7 @@ void UOpenGLRenderDevice::SetTexture( FTextureInfo& Info, DWORD PolyFlags, UBOOL
 		T = (FCachedTexture*)appMalloc( sizeof(FCachedTexture), "GLTex" );
 		T->CacheID = TestID;
 		glGenTextures( 1, &T->GLId );
-		// x64 port: guard file-controlled 0 scale/size — a zero divisor gave
+		// x64 port: guard file-controlled 0 scale/size ??? a zero divisor gave
 		// inf UMult and NaN glTexCoord2f (blank/garbage polys).
 		FLOAT UDiv = Info.UScale * Info.USize, VDiv = Info.VScale * Info.VSize;
 		T->UMult = UDiv!=0.f ? 1.f/UDiv : 0.f;
@@ -1262,14 +1338,14 @@ void UOpenGLRenderDevice::UploadTexture( FTextureInfo& Info, DWORD PolyFlags, UB
 		// x64 port / security: mip dimensions are file-controlled. Reject absurd
 		// sizes so USize*VSize can't overflow the destination allocation/loop
 		// counts (with dims <= MAX_TEXTURE_SIZE, USize*VSize <= 2^20 and the
-		// FColor byte count <= 2^22 — well within INT).
+		// FColor byte count <= 2^22 ??? well within INT).
 		INT USize = Mip->USize, VSize = Mip->VSize;
 		if( USize<=0 || VSize<=0 || USize>MAX_TEXTURE_SIZE || VSize>MAX_TEXTURE_SIZE )
 			break;
 		INT Count = USize*VSize;
 		// Bytes actually available at Src. For loaded textures this is the
 		// serialized DataArray length, which the format does NOT guarantee
-		// matches USize*VSize — so every source read below is clamped to it to
+		// matches USize*VSize ??? so every source read below is clamped to it to
 		// prevent a heap over-read (crash / adjacent-heap info leak into the
 		// uploaded texture). DataPtr buffers are engine-generated and correctly
 		// sized for the format.
@@ -1336,15 +1412,23 @@ void UOpenGLRenderDevice::UploadTexture( FTextureInfo& Info, DWORD PolyFlags, UB
 
 		// x64 port: bake screen brightness into the texel colors via the gamma LUT
 		// (identity when the slider is at neutral 0.5, so this is a no-op then).
-		// NOT for modulated sprite tiles: their texels are blend FACTORS
-		// (2*src*dst), not colors -- the background they multiply is already
-		// gamma-baked, so lifting the texels too double-applies brightness.
-		// Worse, the lift moves the texture's neutral-gray surround (127) off
-		// the blend's fixed neutral point, so at any brightness above 0.5 the
-		// whole quad brightened what's behind it -- a straight-edged light
-		// square riding on the grenade's BlackSmoke trail.
+		// NOT for anything MODULATED: its texels are blend FACTORS (2*src*dst),
+		// not colors -- the background they multiply is already gamma-baked, so
+		// lifting the texels too double-applies brightness. Worse, the lift
+		// moves the texture's neutral-gray surround (127) off the blend's fixed
+		// neutral point, so at any brightness above 0.5 the whole quad
+		// brightened what's behind it -- a straight-edged light square.
+		//
+		// This was first found on the grenade's BlackSmoke trail and fixed for
+		// sprite tiles only, but nothing about the argument is sprite-specific:
+		// modulated WORLD SURFACES break the same way, and more visibly, because
+		// they are big. NyLeve's waterfall lands on HubEffects.WaterRings2, a
+		// modulated ripple decal 2948x2683 across laid over the lake -- at the
+		// shipped Brightness 0.7 its neutral surround lifted and the whole decal
+		// read as a hard-edged pale square sitting at the foot of the fall, with
+		// the ripple rings banding across it.
 		if( (AppliedGamma<0.49f || AppliedGamma>0.51f)
-		&&	!( SpriteTile && (PolyFlags & PF_Modulated) ) )
+		&&	!(PolyFlags & PF_Modulated) )
 			for( INT i=0; i<Count; i++ )
 			{
 				Dst[i].R = GammaLUT[Dst[i].R];
@@ -1366,30 +1450,97 @@ void UOpenGLRenderDevice::UploadTexture( FTextureInfo& Info, DWORD PolyFlags, UB
 		// texels) linearly to neutral per axis: content in the tile's core is
 		// untouched, and no quad edge can ever carry a luminance step. RGB
 		// only -- alpha is left alone so masked alpha-testing is unaffected.
+		// Modulated art's "empty" surround is not exactly neutral (bs2_* sits at
+		// 129..131 vs the 2*src*dst neutral of 127.5), so the whole quad faintly
+		// brightens everything behind it -- a visible straight-edged tint. Same
+		// idea as the translucent dither-floor gate: pull texels within +-12 of
+		// neutral quadratically onto it (continuous at the band edge), which
+		// flattens the surround to a true no-op while leaving real content (the
+		// smoke values 70..110, a ripple ring's light and dark) untouched.
+		//
+		// Applies to every modulated upload, not just sprite tiles. NyLeve's
+		// WaterRings2 is a modulated ripple decal laid on the lake at the big
+		// fall's foot, and its off-neutral surround drew the decal's rectangular
+		// brush outline across the water as a paler box -- the same artifact the
+		// grenade trail showed, just on a world surface. Paired with skipping the
+		// gamma bake for modulated content (above); both are needed, since gamma
+		// moves neutral and this flattens what is already near it.
+		if( PolyFlags & PF_Modulated )
+		{
+			// First remove any uniform DC BIAS. A modulated decal is supposed to
+			// be invisible where it has nothing to say and show only its
+			// variation, but a texture whose flat field does not sit exactly on
+			// 127.5 tints its whole quad -- and since the quad is a mapper's
+			// brush, that tint has straight edges and reads as a pale BOX.
+			// NyLeve's WaterRings2 rests at 134.5 (measured: border 134.3, centre
+			// 135.1, so a genuine constant offset rather than content), which is
+			// 2*134.5/255 = 1.055 -- every pixel behind the decal brightened 5.5%,
+			// which is the square at the foot of the big waterfall.
+			//
+			// This is faithful to 1998 -- the procedural WaveTexture code is
+			// byte-identical to the v200 reference, so retail showed the same box
+			// -- but it is plainly an artifact rather than intent, and it is the
+			// one thing standing between this decal and doing its job.
+			//
+			// Only ever a small correction: if the flat field is more than 25 off
+			// neutral the texture MEANS to darken or brighten (smoke, shadow
+			// decals) and is left alone.
+			//
+			// The estimator is the MODE -- the most common value -- because that
+			// is literally the level most of the texture sits at. The mean is
+			// dragged up by bright crests and the median down by the dark ring
+			// troughs: measured here the mean says 134.5 while the median lands
+			// BELOW neutral, and correcting to the median made the box brighter
+			// rather than dimmer. The mode picks out the flat field the eye reads.
+			INT Hist[256];
+			for( INT h=0; h<256; h++ )
+				Hist[h] = 0;
+			for( INT i=0; i<Count; i++ )
+				Hist[ ( Dst[i].R + Dst[i].G + Dst[i].B + 1 ) / 3 ]++;
+			INT Mode=128, ModeCount=-1;
+			for( INT v=0; v<256; v++ )
+				if( Hist[v] > ModeCount ) { ModeCount = Hist[v]; Mode = v; }
+			FLOAT Bias = 127.5f - (FLOAT)Mode;
+			if( Abs(Bias) > 25.f )
+				Bias = 0.f;
+			// -probemodinfo reports what the estimator saw, so a correction that
+			// does nothing can be told apart from one that is not running.
+			{
+				static UBOOL ModInfo = ParseParam( appCmdLine(), "PROBEMODINFO" );
+				static INT ModLogged = 0;
+				if( ModInfo && ModLogged<10 )
+				{
+					ModLogged++;
+					debugf( NAME_Log, "MODPROBE %ix%i count=%i mode=%i modecount=%i bias=%.1f",
+						USize, VSize, Count, Mode, ModeCount, Bias );
+				}
+			}
+			// -probeflatmod forces every modulated texel to the blend's exact
+			// no-op. Anything still visible afterwards is NOT the texture, which
+			// is how the pale box at the waterfall was traced to the shader.
+			static UBOOL FlatMod = ParseParam( appCmdLine(), "PROBEFLATMOD" );
+			for( INT i=0; i<Count; i++ )
+			{
+				FColor& C = Dst[i];
+				if( FlatMod ) { C.R = C.G = C.B = 128; continue; }
+				BYTE* Ch[3] = { &C.R, &C.G, &C.B };
+				for( INT c=0; c<3; c++ )
+				{
+					FLOAT V = (FLOAT)*Ch[c] + Bias;
+					// Then flatten what is left near neutral, so a surround that
+					// is merely speckly also becomes a true no-op.
+					FLOAT D = V - 127.5f;
+					FLOAT A = Abs(D);
+					if( A < 12.f )
+						V = 127.5f + D*(A/12.f)*(A/12.f);
+					*Ch[c] = (BYTE)Clamp( appRound(V), 0, 255 );
+				}
+			}
+		}
+
 		if( SpriteTile )
 		{
 			FLOAT Neutral = (PolyFlags & PF_Modulated) ? 127.5f : 0.f;
-			// Modulated tiles: the smoke art's "empty" surround is not exactly
-			// neutral (bs2_* sits at 129..131 vs 2*src*dst neutral 127.5), so
-			// the whole quad faintly brightened everything behind it -- on a
-			// bright wall a visible straight-edged tint. Same idea as the
-			// translucent dither-floor gate: pull texels within +-12 of neutral
-			// quadratically onto it (continuous at the band edge), which
-			// flattens the surround to a true no-op while leaving the actual
-			// smoke values (70..110) untouched.
-			if( PolyFlags & PF_Modulated )
-				for( INT i=0; i<Count; i++ )
-				{
-					FColor& C = Dst[i];
-					BYTE* Ch[3] = { &C.R, &C.G, &C.B };
-					for( INT c=0; c<3; c++ )
-					{
-						FLOAT D = (FLOAT)*Ch[c] - 127.5f;
-						FLOAT A = Abs(D);
-						if( A < 12.f )
-							*Ch[c] = (BYTE)( 127.5f + D*(A/12.f)*(A/12.f) );
-					}
-				}
 			INT Fx = Clamp( USize/8, 1, 8 ), Fy = Clamp( VSize/8, 1, 8 );
 			for( INT y=0; y<VSize; y++ )
 			{
@@ -1466,8 +1617,26 @@ void UOpenGLRenderDevice::InitWavyProgram()
 		"uniform vec2 VEdge;\n"			// texcoord-v extent of a stream sheet; y<=x disables
 		"uniform float FlowV;\n"		// 1 = stream flows along t, 0 = along s
 		"uniform float Scroll;\n"		// texture scroll along the flow (texcoord units)
-		"uniform float Blob;\n"			// 0 = stream sheet, 1 = radial droplet, 2 = band (ripple ring)
+		"uniform float Blob;\n"			// 0 = stream sheet, 1 = radial droplet, 2 = band (ripple ring), 3 = falling sheet
 		"uniform float Foam;\n"			// 1 = desaturate toward white (froth)
+		"uniform float Fall;\n"			// 1 = falling sheet (waterfall face)
+		"uniform float FallDown;\n"		// +1 if the flow axis grows downward, else -1
+		"uniform float FallFade;\n"		// 1 = the fall ends in open air, not water
+		"uniform float FallSolid;\n"	// 1 = the fall is opaque, so no alpha tricks
+		// Value noise on a lattice: hashed corners, smoothstepped between.
+		// Used to wobble the froth particles' outlines (see the Blob branch)
+		// so a bank of them does not read as a heap of perfect discs.
+		"float ZHash( vec2 p )\n"
+		"{\n"
+		"	return fract( sin( dot( p, vec2(12.9898,78.233) ) ) * 43758.5453 );\n"
+		"}\n"
+		"float ZNoise( vec2 p )\n"
+		"{\n"
+		"	vec2 i = floor(p), f = fract(p);\n"
+		"	f = f*f*(3.0-2.0*f);\n"
+		"	return mix( mix( ZHash(i), ZHash(i+vec2(1.0,0.0)), f.x ),\n"
+		"	            mix( ZHash(i+vec2(0.0,1.0)), ZHash(i+vec2(1.0,1.0)), f.x ), f.y );\n"
+		"}\n"
 		"void main()\n"
 		"{\n"
 		"	vec2 t = gl_TexCoord[0].st / UVMult;\n"
@@ -1477,10 +1646,22 @@ void UOpenGLRenderDevice::InitWavyProgram()
 		"	float b2 = (t.x-t.y)*0.0785398 + 1.3*Time;\n"
 		"	float dU = Amp*( 0.6*sin(a1) + 0.4*sin(a2) );\n"
 		"	float dV = Amp*( 0.6*cos(b1) + 0.4*cos(b2) );\n"
+		// A falling sheet does not ripple like a pool: its water is drawn out
+		// into long strands running down the face. Displace ALONG the fall by
+		// an amount that varies ACROSS it, so neighbouring strands slip past
+		// one another, and sway only gently sideways. Isotropic pool ripples
+		// on a vertical face read as a wobbling pane, never as a fall.
+		"	float ac = mix( t.y, t.x, FlowV );\n"	// across the fall, in texels
+		"	float al = mix( t.x, t.y, FlowV );\n"	// along it
+		"	float st1 = sin( ac*0.42 + 0.9*Time );\n"
+		"	float st2 = sin( ac*0.13 - 0.5*Time );\n"
+		"	float dAl = Amp*( 2.4*st1 + 3.4*st2 );\n"
+		"	float dAc = Amp*0.30*sin( al*0.045 + 1.4*Time );\n"
+		"	vec2 dF = mix( vec2(dAl,dAc), vec2(dAc,dAl), FlowV );\n"
 		// Stream sheets scroll the droplet texture along the fall -- fast
 		// coherent downward motion is what reads as RUNNING water; the
 		// fractal animation alone just simmers in place.
-		"	vec2 uv = gl_TexCoord[0].st + vec2(dU,dV)*UVMult;\n"
+		"	vec2 uv = gl_TexCoord[0].st + mix( vec2(dU,dV), dF, Fall )*UVMult;\n"
 		"	uv -= mix( vec2(Scroll,0.0), vec2(0.0,Scroll), FlowV );\n"
 		"	vec4 C = texture2D( Tex, uv ) * gl_Color;\n"
 		// Light is clamped at 1.0: overbright (the opaque Pass-2 modulate goes
@@ -1489,6 +1670,24 @@ void UOpenGLRenderDevice::InitWavyProgram()
 		"	C.rgb *= mix( vec3(1.0), min( texture2D( LightTex, gl_TexCoord[1].st ).rgb*2.0, vec3(1.0) ), LightOn );\n"
 		"	float g = 0.5*( 0.6*cos(a1) + 0.4*cos(a2) - 0.6*sin(b1) - 0.4*sin(b2) );\n"
 		"	C.rgb *= BaseMul*( 1.0 + Gloss*g );\n"
+		// Falling water is not an even veil. Under the engine's
+		// ONE/ONE_MINUS_SRC_COLOR translucency the source colour IS the
+		// opacity, so bending the texel toward its own square opens the dark
+		// texels into see-through gaps and leaves the bright ones standing as
+		// solid strands -- a curtain of water rather than a pane of tinted
+		// glass. The strand field then varies their brightness across the
+		// face so the eye has edges to follow as they travel.
+		"	if( Fall > 0.5 )\n"
+		"	{\n"
+		"		float sg = 0.5 + 0.5*sin( ac*0.19 - 0.55*Time + 2.1 );\n"
+		"		float strand = ( 0.5 + 0.5*st1 )*( 0.55 + 0.45*sg );\n"
+		// The opacity gate is for a TRANSLUCENT fall only -- there the colour
+		// is the opacity, so squaring it opens gaps. On an opaque sheet the
+		// same arithmetic just darkens it, so skip it and let the strands do
+		// the work on their own.
+		"		C.rgb = mix( C.rgb*( 0.40 + 1.20*C.rgb ), C.rgb, FallSolid );\n"
+		"		C.rgb *= mix( 0.55 + 1.55*strand, 0.72 + 0.62*strand, FallSolid );\n"
+		"	}\n"
 		// Lateral edge fade for stream sheets: a fountain column is a
 		// hard-edged quad, and under additive translucency dark = transparent,
 		// so rounding the sides off in RGB reads as a narrowing stream. The
@@ -1503,7 +1702,35 @@ void UOpenGLRenderDevice::InitWavyProgram()
 		"	{\n"
 		"		float cu = clamp( (gl_TexCoord[0].s - UEdge.x)/w, 0.0, 1.0 );\n"
 		"		float cv = clamp( (gl_TexCoord[0].t - VEdge.x)/h, 0.0, 1.0 );\n"
-		"		if( Blob > 1.5 )\n"
+		"		if( Blob > 2.5 )\n"
+		"		{\n"
+		// Falling sheet. A fall has no ruled vertical borders and no clean
+		// horizontal top, so soften both sides and melt the lip it comes over.
+		// Extents come from the surface's whole world box, so this is stable as
+		// the camera moves and identical on every facet of the same fall.
+		"			float cx = mix( cv, cu, FlowV );\n"	// across the fall
+		"			float fl = mix( cu, cv, FlowV );\n"	// along it
+		"			fl = mix( 1.0-fl, fl, step( 0.0, FallDown ) );\n"	// 0 = lip, 1 = foot
+		// Edge softening is fading toward TRANSPARENT, which only works under
+		// additive translucency; on an opaque sheet it would paint black
+		// borders, so it is skipped there (mix toward 1.0 = no change).
+		"			float edge = smoothstep( 0.0, 0.10, cx )*( 1.0 - smoothstep( 0.90, 1.0, cx ) )\n"
+		"			           * smoothstep( 0.0, 0.06, fl );\n"
+		"			C.rgb *= mix( edge, 1.0, FallSolid );\n"
+		"			float foot = smoothstep( 0.80, 1.0, fl );\n"
+		// What happens at the bottom depends on whether there is anything down
+		// there. Landing IN water, the fall is aerated where it hits: froth and
+		// brighten. Falling into OPEN AIR -- off a ledge, into a sky box -- it
+		// does not end at all, it thins into spray, so it has to DISSOLVE well
+		// before the sheet's edge. Brightening that edge instead (which is what
+		// the froth did) leaves a lit rectangle hanging in the sky, which is
+		// exactly how the mapper's sheet gives itself away.
+		"			vec3 Wet = mix( C.rgb, vec3( dot( C.rgb, vec3(0.3,0.59,0.11) ) )*1.30 + C.rgb*0.25, foot*0.75 )\n"
+		"			         * ( 1.0 + 0.45*foot );\n"
+		"			vec3 Air = C.rgb * ( 1.0 - smoothstep( 0.35, 0.97, fl ) );\n"
+		"			C.rgb = mix( Wet, Air, FallFade*( 1.0 - FallSolid ) );\n"
+		"		}\n"
+		"		else if( Blob > 1.5 )\n"
 		"		{\n"
 		// Ripple ring: soft band across its width, unbroken along its length
 		// (so ring segments join seamlessly).
@@ -1513,9 +1740,24 @@ void UOpenGLRenderDevice::InitWavyProgram()
 		"		}\n"
 		"		else if( Blob > 0.5 )\n"
 		"		{\n"
-		// Fountain particle: soft radial droplet, texture detail inside.
+		// Droplet / froth puff. A plain radial gate (1 - dot(q,q)) is a
+		// perfect disc, and a bank of them reads as a heap of BUBBLES rather
+		// than as foam. So wobble the silhouette: the cutoff radius varies
+		// with direction, by a noise sampled on the unit circle (continuous
+		// all the way round -- keyed to the ANGLE it would seam at +/-pi) and
+		// offset by a per-particle seed riding in on texcoord r, so no two
+		// puffs are the same shape. Two octaves: one for the overall lopsided
+		// outline, one for the ragged edge.
 		"			vec2 q = vec2(cu,cv)*2.0 - 1.0;\n"
-		"			C.rgb *= max( 1.0 - dot(q,q), 0.0 );\n"
+		"			float r = length(q);\n"
+		"			vec2 dir = q / max( r, 0.001 );\n"
+		"			float sd = gl_TexCoord[0].p;\n"
+		// Clamped below 1: the gate has to reach zero INSIDE the quad, or the
+		// puff is cut off square along the quad's own edge and the hard
+		// rectangle is worse than the disc it replaced.
+		"			float wob = min( 0.62 + 0.46*ZNoise( dir*2.2 + vec2(sd*11.0,sd*7.0) )\n"
+		"			                      + 0.20*ZNoise( dir*5.5 + vec2(sd*3.0,sd*13.0) ), 0.97 );\n"
+		"			C.rgb *= max( 1.0 - (r*r)/max( wob*wob, 0.04 ), 0.0 );\n"
 		"		}\n"
 		"		else\n"
 		"		{\n"
@@ -1547,6 +1789,10 @@ void UOpenGLRenderDevice::InitWavyProgram()
 	WavyLocScroll  = ZglGetUniformLocation( Program, "Scroll" );
 	WavyLocBlob    = ZglGetUniformLocation( Program, "Blob" );
 	WavyLocFoam    = ZglGetUniformLocation( Program, "Foam" );
+	WavyLocFall    = ZglGetUniformLocation( Program, "Fall" );
+	WavyLocFallDn  = ZglGetUniformLocation( Program, "FallDown" );
+	WavyLocFallFd  = ZglGetUniformLocation( Program, "FallFade" );
+	WavyLocFallSol = ZglGetUniformLocation( Program, "FallSolid" );
 	ZglUseProgram( Program );
 	ZglUniform1i( ZglGetUniformLocation( Program, "LightTex" ), 1 );
 	ZglUseProgram( 0 );
@@ -1597,6 +1843,511 @@ static inline FLOAT ZSmooth( FLOAT A, FLOAT B, FLOAT X )
 	return X*X*(3.f-2.f*X);
 }
 
+// What is underneath a fall, and where its water surface is. Returns 1 and
+// fills SurfZ when the foot ends in water; 0 when it ends in anything else --
+// stone, or nothing at all, which is what a fall spilling off a ledge into a
+// sky box does. The sheet's own shading and its particles must agree about
+// this, so both ask here.
+static UBOOL ZFallLandsInWater( FSceneNode* Frame, const FVector& Centre, const FVector& Spread, FLOAT BottomZ, FLOAT& SurfZ )
+{
+	if( !Frame->Level || !Frame->Level->Model || !Frame->Level->GetLevelInfo() )
+		return 0;
+	ALevelInfo* Info = Frame->Level->GetLevelInfo();
+	UModel* Model = Frame->Level->Model;
+	FVector Probe = Centre;
+	// Search DOWN for the water, not just immediately below. A fall is rarely
+	// one sheet: mappers split it where the rock steps, so the piece you are
+	// drawing often stops a hundred units or more above the pool the whole
+	// thing lands in (SkyTown's ends at z=2080 over a river at 1952). Probing
+	// only just under the sheet found air there and the landing went undrawn.
+	// Bounded, so this cannot reach through a floor into unrelated water below.
+	// Sampled ACROSS the foot as well as down it: a slanted sheet's bounding-box
+	// centre can sit well to one side of where the water actually is (SkyTown's
+	// is at x=590 with the river ending at x=384), so a single plumb line down
+	// the middle misses the pool entirely.
+	// Kept SHORT. A fall is usually several stacked sheets, and a generous
+	// search let every one of them find the pool at the bottom and draw a
+	// landing there -- so the upper sheets put froth on the water far from
+	// where they end, behind whatever geometry sits between. Only the sheet
+	// that genuinely reaches the water gets a foot; the ones above it land on
+	// the next sheet down, which is not an event.
+	const FLOAT MaxDrop = 64.f;
+	UBOOL Found = 0;
+	for( FLOAT D=6.f; D<=MaxDrop && !Found; D+=12.f )
+		for( INT s=0; s<5 && !Found; s++ )
+		{
+			Probe = Centre + Spread*( s==0 ? 0.f : (s<3 ? 0.45f : 0.9f)*( (s&1) ? 1.f : -1.f ) );
+			Probe.Z = BottomZ - D;
+			AZoneInfo* BZone = Model->PointRegion( Info, Probe ).Zone;
+			if( BZone && BZone->bWaterZone )
+				{ BottomZ -= D; Found = 1; }
+		}
+	static UBOOL FallInfo = ParseParam( appCmdLine(), "PROBEFALLINFO" );
+	if( FallInfo )
+		debugf( "FALLFOOT: centre=(%.0f,%.0f,%.0f) found=%i", Centre.X, Centre.Y, Centre.Z, (INT)Found );
+	if( !Found )
+		return 0;
+	// Walk UP out of the water for the true surface: sheets are often built
+	// poking a little way into the pool.
+	SurfZ = BottomZ + 1.f;
+	for( INT st=0; st<10; st++ )
+	{
+		Probe.Z = BottomZ + st*4.f;
+		AZoneInfo* PZone = Model->PointRegion( Info, Probe ).Zone;
+		if( !PZone || !PZone->bWaterZone )
+			{ SurfZ = Probe.Z; break; }
+	}
+	SurfZ += 1.f;	// clear of the pool surface itself
+	return 1;
+}
+
+// Where a waterfall LANDS. The sheet stops dead at the waterline, so however
+// well it falls it reads as passing BEHIND a pane of water rather than hitting
+// it -- a fall with no foot is the single loudest thing left. Three effects are
+// drawn along the line where the sheet meets the pool, all of them pure
+// functions of level time (stateless, so saves, demos and paused frames agree),
+// and all sized off the fall's own width:
+//   FROTH  aerated white puffs churning on the line and drifting outward, drawn
+//          FLAT IN the water plane -- camera-facing froth stands up out of the
+//          water the moment you look down on it from a ledge.
+//   WAKE   ripple bands travelling out from the line to either side, born on
+//          the cadence of the water arriving rather than a clock of their own.
+//   SPRAY  droplets thrown up and out of the impact and arcing back down. These
+//          ARE camera-facing: they are in the air, not on the surface.
+// Only when the foot really ends in water -- a fall onto stone gets none of it.
+void UOpenGLRenderDevice::DrawFallFoot( FSceneNode* Frame, FSurfaceInfo& Surface, FSurfaceFacet& Facet,
+	DOUBLE T, FLOAT BaseUM, FLOAT BaseVM, UBOOL FoldLight, FLOAT LightUM, FLOAT LightVM )
+{
+	guard(UOpenGLRenderDevice::DrawFallFoot);
+	if( !Facet.Bounds.IsValid || !Surface.Texture || !Frame->Level
+	 || !Frame->Level->Model || !Frame->Level->GetLevelInfo() )
+		return;
+	static UBOOL NoFoot = ParseParam( appCmdLine(), "PROBENOFALLFOOT" );
+	if( NoFoot )
+		return;
+
+	FVector WMin = Facet.Bounds.Min, WMax = Facet.Bounds.Max;
+	FLOAT HX = WMax.X-WMin.X, HY = WMax.Y-WMin.Y, Height = Max( WMax.Z-WMin.Z, 1.f );
+
+	// Where the foot actually IS. A sheet's bounding-box centre is only its
+	// foot when the sheet is vertical; on a SLANTED one (SkyTown's fall drops
+	// 1280 while running 825 x 704 sideways) the box centre is halfway up the
+	// slope, which is inside the rock. Everything was being emitted and probed
+	// there, which is why no foam ever appeared however bright it was made.
+	//
+	// So walk from the box centre DOWN-SLOPE to the box edge: the plane's
+	// steepest-descent direction, flattened, is which way the foot lies.
+	FVector NEye = Facet.MapCoords.ZAxis;
+	FVector NW   = NEye.TransformVectorBy( Frame->Uncoords );
+	FLOAT NWLen = NW.Size();
+	if( NWLen > 0.0001f )
+		NW /= NWLen;
+	FVector Down( 0, 0, -1 );
+	FVector Slope = Down - NW*(NW|Down);		// steepest descent, in the plane
+	FVector Dh( Slope.X, Slope.Y, 0.f );		// ... flattened: toward the foot
+	FLOAT DhLen = Dh.Size();
+	FVector Along, Out;
+	FLOAT Width;
+	FVector Centre( (WMin.X+WMax.X)*0.5f, (WMin.Y+WMax.Y)*0.5f, WMin.Z );
+	if( DhLen > 0.05f )
+		Dh /= DhLen;
+	// The foot line runs ALONG the sheet horizontally, which is the direction
+	// perpendicular to its normal and to up -- always, whatever the sheet's
+	// tilt. Taking it from the bounding box's longer axis instead was the axis
+	// bug: a vertical sheet set at an angle to the world grid (SkyTown's runs
+	// 208 x 481 in plan) has a DIAGONAL footprint, so snapping the foot to Y
+	// laid the foam away from the viewer instead of across the fall's face.
+	FVector AlongRaw = NW ^ FVector(0,0,1);
+	FLOAT AL = AlongRaw.Size();
+	if( AL > 0.001f )
+	{
+		Along = AlongRaw/AL;
+		Out   = FVector( -Along.Y, Along.X, 0.f );	// horizontal, out of the face
+		if( DhLen > 0.05f && (Out|Dh) < 0.f )
+			Out = -Out;								// point it downhill
+		// Extent of the box along the foot line: for a diagonal footprint this
+		// is its true length, since only one axis pair can be spanned at once.
+		Width = Max( Abs(Along.X)*HX + Abs(Along.Y)*HY, 16.f );
+		if( DhLen > 0.05f )
+			Centre += Dh*( 0.5f*( Abs(Dh.X)*HX + Abs(Dh.Y)*HY ) );
+	}
+	else
+	{
+		// Degenerate (a horizontal face): nothing sensible to run a line along.
+		UBOOL AlongX = HX >= HY;
+		Width = Max( AlongX ? HX : HY, 16.f );
+		Along = AlongX ? FVector(1,0,0) : FVector(0,1,0);
+		Out   = AlongX ? FVector(0,1,0) : FVector(1,0,0);
+	}
+
+	// Landing in water gets froth, wakes and spray ON the surface; falling into
+	// open air gets none of those -- there is no surface -- but it does get
+	// spray carrying on downward and thinning out, which is what stops the
+	// sheet reading as a slab with a cut-off bottom.
+	FLOAT SurfZ = WMin.Z;
+	FVector Spread = Along*(Width*0.5f) + Out*32.f;
+	UBOOL Lands = ZFallLandsInWater( Frame, Centre, Spread, WMin.Z, SurfZ );
+	// Now that the waterline is known, put the foot EXACTLY where the sheet
+	// meets it: the line where the sheet's own plane crosses z = SurfZ. The
+	// approximation above (box centre pushed down-slope by the box's support
+	// width) overshoots on a diagonal sheet, whose plan-view footprint is a
+	// line rather than the whole box -- SkyTown's landed 64 units outside the
+	// sheet and laid the foam along the wrong axis, so the foam spread away
+	// from the viewer instead of across the fall's face.
+	if( Lands && DhLen > 0.05f )
+	{
+		FVector P0w = Facet.MapCoords.Origin.TransformPointBy( Frame->Uncoords );
+		FLOAT Denom = NW | Dh;
+		if( Abs(Denom) > 0.02f )
+		{
+			FVector C( (WMin.X+WMax.X)*0.5f, (WMin.Y+WMax.Y)*0.5f, SurfZ );
+			FLOAT t = -( NW | (C - P0w) )/Denom;
+			FVector Hit = C + Dh*t;
+			// Only trust it if it lands on the sheet's own footprint.
+			if( Hit.X >= WMin.X-64.f && Hit.X <= WMax.X+64.f
+			 && Hit.Y >= WMin.Y-64.f && Hit.Y <= WMax.Y+64.f )
+			{
+				Centre = Hit;
+				Centre.Z = SurfZ;
+				// The foot line runs ALONG the sheet horizontally; its length is
+				// that line clipped to the sheet's box, not the box's support
+				// width (which counts both extents and over-measures a diagonal).
+				FLOAT S0 = -100000.f, S1 = 100000.f;
+				for( INT ax=0; ax<2; ax++ )
+				{
+					FLOAT A  = ax ? Along.Y : Along.X;
+					FLOAT Cc = ax ? Centre.Y : Centre.X;
+					FLOAT Lo = ax ? WMin.Y : WMin.X;
+					FLOAT Hi = ax ? WMax.Y : WMax.X;
+					if( Abs(A) < 0.0001f )
+						{ if( Cc<Lo || Cc>Hi ) { S0=0.f; S1=0.f; } continue; }
+					FLOAT Ta = (Lo-Cc)/A, Tb = (Hi-Cc)/A;
+					S0 = Max( S0, Min(Ta,Tb) );
+					S1 = Min( S1, Max(Ta,Tb) );
+				}
+				if( S1 > S0 )
+				{
+					Centre += Along*( 0.5f*(S0+S1) );	// midpoint of the wetted line
+					Width   = Max( S1-S0, 16.f );
+				}
+			}
+		}
+	}
+	{
+		static UBOOL DrawInfo = ParseParam( appCmdLine(), "PROBEFALLINFO" );
+		if( DrawInfo )
+			debugf( "FALLDRAW: box=(%.0f,%.0f,%.0f)..(%.0f,%.0f,%.0f) lands=%i surfZ=%.0f foot=(%.0f,%.0f) width=%.0f",
+				WMin.X, WMin.Y, WMin.Z, WMax.X, WMax.Y, WMax.Z, (INT)Lands, SurfZ, Centre.X, Centre.Y, Width );
+	}
+	// How far the spray carries on below the sheet when there is nothing to
+	// land on -- proportional to the fall, so a short spill trails a little and
+	// a long one trails a lot.
+	FLOAT Drop = Clamp( Height*0.7f, 64.f, 900.f );
+
+	// Scale: everything keys off the fall's width, clamped so a 32-unit spout
+	// and a 500-unit curtain both land somewhere sane.
+	// Kept SMALL and dim on purpose: under the engine's additive translucency a
+	// bright particle saturates to solid white, and once it does its soft
+	// radial falloff is clipped away and it reads as a flat square. Many small
+	// faint ones, never a few big bright ones.
+	FLOAT R = Clamp( Width*0.05f, 4.f, 34.f );
+	// Cadence: the same fall time the water itself takes, so froth churns and
+	// wakes are born as water arrives.
+	FLOAT FallTime = Max( 0.25f, Height/350.f );
+	// How much the camera is looking DOWN on the pool. The effects that lie IN
+	// the water plane are only legible from above -- seen from the waterline
+	// they compress to hairlines and read as drawn stripes -- so they fade out
+	// as the view flattens. (The airborne ones are camera-facing and don't
+	// care.) World up resolved into eye space: its forward component is zero
+	// looking level and one looking straight down.
+	FLOAT FlatFade = Clamp( Abs( FVector(0,0,1).TransformVectorBy( Frame->Coords ).Z )*2.5f, 0.12f, 1.f );
+
+	// All three sample the same small drifting window of the fall's own
+	// animated texture; the shader's Blob profile makes the shape.
+	FLOAT TexU = (FLOAT)Surface.Texture->USize, TexV = (FLOAT)Surface.Texture->VSize;
+	FLOAT WinU = Min( 28.f, TexU ), WinV = Min( 28.f, TexV );
+	FLOAT W0u = (FLOAT)fmod( T*11.0, (DOUBLE)Max( 1.f, TexU-WinU ) );
+	FLOAT W0v = (FLOAT)fmod( T* 7.0, (DOUBLE)Max( 1.f, TexV-WinV ) );
+	FLOAT SU0 = W0u*BaseUM, SU1 = (W0u+WinU)*BaseUM;
+	FLOAT SV0 = W0v*BaseVM, SV1 = (W0v+WinV)*BaseVM;
+
+	// Froth and spray are ALWAYS translucent, whatever the sheet is. On an
+	// opaque fall the surface's own blend would draw every particle as a solid
+	// square; the caller's next pass resets the blend anyway (CurrentBlendFlags
+	// is poisoned below), so borrowing it here is safe.
+	if( !(Surface.PolyFlags & PF_Translucent) )
+	{
+		SetBlend( (Surface.PolyFlags & ~(PF_Modulated|PF_Masked)) | PF_Translucent );
+		CurrentBlendFlags = (DWORD)-1;
+	}
+
+	// Shared shader state: no strand shading, no warp, no grain on any of this.
+	ZglUniform1f( WavyLocFall, 0.f );
+	ZglUniform1f( WavyLocAmp, 0.f );
+	ZglUniform1f( WavyLocGloss, 0.f );
+	ZglUniform1f( WavyLocBase, 1.f );
+	ZglUniform1f( WavyLocScroll, 0.f );
+	ZglUniform1f( WavyLocFlowV, 1.f );
+	ZglUniform2f( WavyLocUEdge, SU0, SU1 );
+	ZglUniform2f( WavyLocVEdge, SV0, SV1 );
+
+	// Light-map coordinate for a world point, projected through the sheet's own
+	// mapping (as the fountain particles do): approximate off the sheet plane,
+	// but it keeps the effects lit like the water they belong to.
+	#define ZFOOTLIGHT(Pe) \
+		if( FoldLight ) \
+		{ \
+			FLOAT LU = Facet.MapCoords.XAxis | ((Pe) - Facet.MapCoords.Origin); \
+			FLOAT LV = Facet.MapCoords.YAxis | ((Pe) - Facet.MapCoords.Origin); \
+			ZglMultiTexCoord2f( GL_TEXTURE1, \
+				(LU-Surface.LightMap->Pan.X+0.5f*Surface.LightMap->UScale)*LightUM, \
+				(LV-Surface.LightMap->Pan.Y+0.5f*Surface.LightMap->VScale)*LightVM ); \
+		}
+
+	// ---- WAKE: ripple bands running out from the line, both sides ----------
+	ZglUniform1f( WavyLocBlob, 2.f );
+	ZglUniform1f( WavyLocFoam, 0.40f );
+	if( Lands )
+	{
+		const INT NBands = 3, NSeg = 10;
+		FLOAT BandTime = FallTime*NBands;
+		FLOAT BandPh = (FLOAT)( fmod( T, (DOUBLE)BandTime ) / BandTime );
+		FLOAT L = Width*0.55f;		// half-length, a little past the sheet
+		glBegin( GL_QUADS );
+		for( INT r=0; r<NBands; r++ )
+		{
+			FLOAT Sr = (FLOAT)r/(FLOAT)NBands + BandPh;
+			Sr -= appFloor(Sr);
+			// Kept THICK and faint: seen from the waterline a thin band projects
+			// to a one-pixel line, and a bright one reads as a drawn stripe
+			// rather than a ripple.
+			FLOAT Dist = R*( 0.8f + 7.0f*Sr );		// travelling outward
+			FLOAT Half = R*( 0.55f + 0.85f*Sr );	// and widening
+			FLOAT Ar = ZSmooth( 0.f, 0.12f, Sr )*( 1.f-ZSmooth( 0.20f, 1.f, Sr ) )*0.14f*FlatFade;
+			if( Ar <= 0.002f )
+				continue;
+			glColor3f( Ar, Ar, Ar );
+			for( INT s=-1; s<=1; s+=2 )
+			{
+				FLOAT D0 = s*(Dist-Half), D1 = s*(Dist+Half);
+				for( INT g=0; g<NSeg; g++ )
+				{
+					FLOAT A0 = -L + (2.f*L*g)/NSeg, A1 = -L + (2.f*L*(g+1))/NSeg;
+					FLOAT T0 = SV0 + (SV1-SV0)*((FLOAT)g/NSeg);
+					FLOAT T1 = SV0 + (SV1-SV0)*((FLOAT)(g+1)/NSeg);
+					FVector Q[4];
+					Q[0] = Centre + Along*A0 + Out*D0;
+					Q[1] = Centre + Along*A0 + Out*D1;
+					Q[2] = Centre + Along*A1 + Out*D1;
+					Q[3] = Centre + Along*A1 + Out*D0;
+					FVector E[4];
+					UBOOL Bad = 0;
+					for( INT q=0; q<4; q++ )
+					{
+						Q[q].Z = SurfZ;
+						E[q] = Q[q].TransformPointBy( Frame->Coords );
+						if( E[q].Z < 1.f )
+							Bad = 1;
+					}
+					if( Bad )
+						continue;
+					ZFOOTLIGHT(E[0]); glTexCoord2f( SU0, T0 ); glVertex3f( E[0].X, E[0].Y, E[0].Z );
+					ZFOOTLIGHT(E[1]); glTexCoord2f( SU1, T0 ); glVertex3f( E[1].X, E[1].Y, E[1].Z );
+					ZFOOTLIGHT(E[2]); glTexCoord2f( SU1, T1 ); glVertex3f( E[2].X, E[2].Y, E[2].Z );
+					ZFOOTLIGHT(E[3]); glTexCoord2f( SU0, T1 ); glVertex3f( E[3].X, E[3].Y, E[3].Z );
+				}
+			}
+		}
+		glEnd();
+		PolyCount++;
+	}
+
+	// ---- FROTH: white churn on the line, spreading outward ----------------
+	ZglUniform1f( WavyLocBlob, 1.f );
+	ZglUniform1f( WavyLocFoam, 1.f );
+	if( Lands )
+	{
+		INT NFoam = Clamp( (INT)(Width/8.f) + 20, 24, 140 );
+		FLOAT FoamTime = Max( 0.40f, FallTime );
+		FLOAT FoamPh = (FLOAT)( fmod( T, (DOUBLE)FoamTime ) / FoamTime );
+		glBegin( GL_QUADS );
+		for( INT m=0; m<NFoam; m++ )
+		{
+			DWORD hm = (DWORD)(m+7)*2246822519u;
+			DWORD g1 = hm ^ (hm>>13);
+			DWORD g2 = (hm*3266489917u+374761393u); g2 ^= g2>>15;
+			DWORD g3 = (hm*668265263u+1u);          g3 ^= g3>>17;
+			FLOAT G1 = (g1 & 0xFFFFu)/65536.f;
+			FLOAT G2 = (g2 & 0xFFFFu)/65536.f;
+			FLOAT G3 = (g3 & 0xFFFFu)/65536.f;
+			FLOAT Sf = G1 + FoamPh;
+			Sf -= appFloor(Sf);
+			// NOT faded by the view angle. The wake BANDS had to be, because
+			// seen edge-on they collapse into drawn-looking stripes -- but
+			// froth is blobs, and seen from the waterline they pile up into
+			// exactly what a fall's foot should have there: a band of white
+			// water. Fading these out was why there was no foam at eye level.
+			FLOAT Af = ZSmooth( 0.f, 0.12f, Sf )*( 1.f-ZSmooth( 0.30f, 1.f, Sf ) )*( 0.16f + 0.18f*G2 );
+			if( Af <= 0.002f )
+				continue;
+			FLOAT Side  = (g3 & 0x10000u) ? 1.f : -1.f;
+			// Wanders ALONG the line as well as out from it, or the puffs land
+			// in tidy rows and read as a checkerboard.
+			FLOAT UPos  = (G2*2.f-1.f)*Width*0.5f + (G3*2.f-1.f)*R*1.5f*Sf;
+			FLOAT Drift = R*( 0.2f + 1.8f*Sf*(0.4f+0.6f*G3) );
+			FLOAT Rf    = R*( 0.35f + 0.40f*G3 )*( 0.6f + 0.8f*Sf );
+			FVector Pw = Centre + Along*UPos + Out*(Side*Drift);
+			Pw.Z = SurfZ;
+			// Elliptical and turned, not an axis-aligned square: the quad's
+			// own shape has to vary too, or the shader's wobble is the only
+			// thing breaking up a field of identical outlines.
+			FLOAT Ang = G1*2.f*PI, Ca = appCos(Ang), Sa = appSin(Ang);
+			FLOAT AxA = Rf*( 0.75f + 0.75f*G2 ), AxB = Rf*( 0.70f + 0.60f*G3 );
+			FVector Ea = Along*(Ca*AxA) + Out*(Sa*AxA);
+			FVector Eb = Along*(-Sa*AxB) + Out*(Ca*AxB);
+			FVector P0 = Pw - Ea - Eb, P1 = Pw + Ea - Eb;
+			FVector P2 = Pw + Ea + Eb, P3 = Pw - Ea + Eb;
+			FVector E0 = P0.TransformPointBy( Frame->Coords );
+			FVector E1 = P1.TransformPointBy( Frame->Coords );
+			FVector E2 = P2.TransformPointBy( Frame->Coords );
+			FVector E3 = P3.TransformPointBy( Frame->Coords );
+			if( E0.Z<1.f || E1.Z<1.f || E2.Z<1.f || E3.Z<1.f )
+				continue;
+			glColor3f( Af, Af, Af );
+			ZFOOTLIGHT(E0); glTexCoord3f( SU0, SV0, G3 ); glVertex3f( E0.X, E0.Y, E0.Z );
+			ZFOOTLIGHT(E1); glTexCoord3f( SU1, SV0, G3 ); glVertex3f( E1.X, E1.Y, E1.Z );
+			ZFOOTLIGHT(E2); glTexCoord3f( SU1, SV1, G3 ); glVertex3f( E2.X, E2.Y, E2.Z );
+			ZFOOTLIGHT(E3); glTexCoord3f( SU0, SV1, G3 ); glVertex3f( E3.X, E3.Y, E3.Z );
+		}
+		glEnd();
+		PolyCount++;
+	}
+
+	// ---- MIST: the aerated haze standing over the impact ------------------
+	// The flat-in-the-water effects above only read when you are looking DOWN
+	// on the pool; from the waterline they compress to hairlines. What the eye
+	// actually reads at a fall's foot from any angle is airborne mist, so this
+	// is CAMERA-FACING: a low bank of large, very faint white puffs rising off
+	// the line and dissipating. Faint and overlapping, never individually
+	// legible -- it is the union of them that reads as froth.
+	ZglUniform1f( WavyLocFoam, 1.f );
+	{
+		INT NMist = Clamp( (INT)(Width/5.f) + 30, 40, 220 );
+		FLOAT MistTime = Max( 0.9f, FallTime*2.f );
+		FLOAT MistPh = (FLOAT)( fmod( T, (DOUBLE)MistTime ) / MistTime );
+		glBegin( GL_QUADS );
+		for( INT m=0; m<NMist; m++ )
+		{
+			DWORD hm = (DWORD)(m+53)*2654435761u;
+			DWORD g1 = hm ^ (hm>>14);
+			DWORD g2 = (hm*1103515245u+12345u); g2 ^= g2>>16;
+			DWORD g3 = (hm*668265263u+1u);      g3 ^= g3>>17;
+			FLOAT G1 = (g1 & 0xFFFFu)/65536.f;
+			FLOAT G2 = (g2 & 0xFFFFu)/65536.f;
+			FLOAT G3 = (g3 & 0xFFFFu)/65536.f;
+			FLOAT Sm = G1 + MistPh;
+			Sm -= appFloor(Sm);
+			// Mist is what carries the foot from the waterline, where the flat
+			// effects are edge-on. At 0.03 it was invisible over bright water.
+			FLOAT Am = ZSmooth( 0.f, 0.18f, Sm )*( 1.f-ZSmooth( 0.25f, 1.f, Sm ) )*( 0.075f + 0.10f*G2 );
+			if( Am <= 0.002f )
+				continue;
+			FLOAT Side = (g3 & 0x10000u) ? 1.f : -1.f;
+			FLOAT UPos = (G2*2.f-1.f)*Width*0.5f + (G3*2.f-1.f)*R*2.f*Sm;
+			FVector Pw = Centre + Along*UPos + Out*( Side*R*(0.3f + 1.5f*Sm*(0.4f+0.6f*G3)) );
+			// Landing in water, the mist RISES off the surface. Falling into
+			// open air it goes on DOWN, thinning as it goes -- water leaving a
+			// ledge does not stop at the bottom of the mapper's sheet.
+			// Heights SPREAD either way, not a row: puffs at one altitude read
+			// as a line of separate bubbles instead of a bank of mist.
+			if( Lands )
+				Pw.Z = SurfZ + R*( 0.1f + 3.4f*Sm*(0.25f+0.75f*G2) );
+			else
+				Pw.Z = WMin.Z - Drop*Sm*( 0.35f + 0.65f*G2 );
+			FLOAT Rm = R*( 0.7f + 0.8f*G3 )*( 0.6f + 1.0f*Sm );	// swelling as it goes
+			FVector Pp = Pw.TransformPointBy( Frame->Coords );
+			if( Pp.Z < 1.f )
+				continue;
+			ZFOOTLIGHT(Pp);
+			glColor3f( Am, Am, Am );
+			// Wider than tall and turned, on top of the shader's ragged edge:
+			// mist lies in flattened banks, it does not stack up in balls.
+			FLOAT Ang = G1*2.f*PI, Ca = appCos(Ang), Sa = appSin(Ang);
+			FLOAT AxA = Rm*( 0.9f + 0.6f*G2 ), AxB = Rm*( 0.55f + 0.35f*G3 );
+			FLOAT AX = Ca*AxA, AY = Sa*AxA, BX = -Sa*AxB, BY = Ca*AxB;
+			glTexCoord3f( SU0, SV0, G2 ); glVertex3f( Pp.X-AX-BX, Pp.Y-AY-BY, Pp.Z );
+			glTexCoord3f( SU1, SV0, G2 ); glVertex3f( Pp.X+AX-BX, Pp.Y+AY-BY, Pp.Z );
+			glTexCoord3f( SU1, SV1, G2 ); glVertex3f( Pp.X+AX+BX, Pp.Y+AY+BY, Pp.Z );
+			glTexCoord3f( SU0, SV1, G2 ); glVertex3f( Pp.X-AX+BX, Pp.Y-AY+BY, Pp.Z );
+		}
+		glEnd();
+		PolyCount++;
+	}
+
+	// ---- SPRAY: droplets thrown out of the impact ------------------------
+	ZglUniform1f( WavyLocFoam, 0.35f );
+	{
+		INT NSpray = Clamp( (INT)(Width/6.f) + 24, 30, 160 );
+		FLOAT FlyTime = Max( 0.45f, FallTime*1.3f );
+		FLOAT FlyPh = (FLOAT)( fmod( T, (DOUBLE)FlyTime ) / FlyTime );
+		glBegin( GL_QUADS );
+		for( INT k=0; k<NSpray; k++ )
+		{
+			DWORD hk = (DWORD)(k+29)*2654435761u;
+			DWORD h1 = hk ^ (hk>>15);
+			DWORD h2 = (hk*1103515245u+12345u); h2 ^= h2>>16;
+			DWORD h3 = (hk*22695477u+1u);       h3 ^= h3>>13;
+			FLOAT H1 = (h1 & 0xFFFFu)/65536.f;
+			FLOAT H2 = (h2 & 0xFFFFu)/65536.f;
+			FLOAT H3 = (h3 & 0xFFFFu)/65536.f;
+			FLOAT Sp = H1 + FlyPh;
+			Sp -= appFloor(Sp);
+			FLOAT Ap = ZSmooth( 0.f, 0.08f, Sp )*( 1.f-ZSmooth( 0.45f, 1.f, Sp ) )*( 0.28f + 0.30f*H2 );
+			if( Ap <= 0.002f )
+				continue;
+			FLOAT Side = (h3 & 0x10000u) ? 1.f : -1.f;
+			FLOAT UPos = (H2*2.f-1.f)*Width*0.5f + (H1*2.f-1.f)*R;
+			FVector Pw = Centre + Along*UPos + Out*( Side*R*(0.15f + 1.6f*Sp*(0.4f+0.6f*H3)) );
+			FLOAT Rd = R*( 0.10f + 0.11f*H3 );
+			if( Lands )
+			{
+				// Thrown out of the impact: a ballistic arc, up and out, falling
+				// back. Rise peaks mid-life.
+				FLOAT Rise = 4.f*Sp*(1.f-Sp);
+				Pw.Z = SurfZ + Rise*R*( 0.8f + 1.4f*H2 );
+			}
+			else
+			{
+				// Nothing to hit: the water keeps going, accelerating and
+				// pulling apart, until it is too thin to see.
+				FLOAT FallS = Sp*Sp*0.75f + Sp*0.25f;
+				Pw.Z = WMin.Z - Drop*FallS*( 0.5f + 0.5f*H2 );
+				Rd  *= 0.7f + 0.8f*FallS;
+			}
+			FVector Pp = Pw.TransformPointBy( Frame->Coords );
+			if( Pp.Z < 1.f )
+				continue;
+			ZFOOTLIGHT(Pp);
+			glColor3f( Ap, Ap, Ap );
+			// Camera-facing, stretched a little along screen-vertical so a
+			// droplet reads as moving rather than hanging.
+			FLOAT LY = Rd*1.7f, WX = Rd;
+			glTexCoord3f( SU0, SV0, H3 ); glVertex3f( Pp.X-WX, Pp.Y-LY, Pp.Z );
+			glTexCoord3f( SU1, SV0, H3 ); glVertex3f( Pp.X+WX, Pp.Y-LY, Pp.Z );
+			glTexCoord3f( SU1, SV1, H3 ); glVertex3f( Pp.X+WX, Pp.Y+LY, Pp.Z );
+			glTexCoord3f( SU0, SV1, H3 ); glVertex3f( Pp.X-WX, Pp.Y+LY, Pp.Z );
+		}
+		glEnd();
+		PolyCount++;
+	}
+
+	ZglUniform1f( WavyLocFoam, 0.f );
+	ZglUniform1f( WavyLocBlob, 0.f );
+	glColor3f( 1.f, 1.f, 1.f );
+	#undef ZFOOTLIGHT
+	unguard;
+}
+
 void UOpenGLRenderDevice::DrawComplexSurface( FSceneNode* Frame, FSurfaceInfo& Surface, FSurfaceFacet& Facet )
 {
 	guard(UOpenGLRenderDevice::DrawComplexSurface);
@@ -1614,10 +2365,27 @@ void UOpenGLRenderDevice::DrawComplexSurface( FSceneNode* Frame, FSurfaceInfo& S
 
 	UBOOL Masked = (Surface.PolyFlags & PF_Masked)!=0;
 
+	// Inside the sky box (see SetSceneNode): its CLOUD SHEETS churn -- the one
+	// sky treatment that survived: a sheet of clouds sliding rigidly across is
+	// the clearest tell that a sky is a painted box, and the same per-pixel
+	// warp that reads as water at water speed reads as weather at a fraction of
+	// it. Nothing else about the sky is changed; it draws as stock.
+	UBOOL SkyLook = SkyFrame != 0;
+	static UBOOL NoChurn = ParseParam( appCmdLine(), "PROBENOCHURN" );
+	UBOOL SkyCloud = SkyLook && !NoChurn
+	              && (Surface.PolyFlags & (PF_AutoUPan|PF_AutoVPan))!=0;
+
 	// Pass 1: base texture (or flat color). PF_SmallWavy/PF_BigWavy -- and
 	// translucent auto-panning surfaces, i.e. flowing water -- bind the
 	// per-pixel warp program for this pass only (see InitWavyProgram): same
 	// fan, same depth, only the texture lookup undulates.
+	//
+	// x64 port: pin the vertex colour to white. Other passes (fall-foot
+	// particles, coronas) leave their last glColor behind, and the base fan
+	// here inherits whatever that was -- caught by the -probeglstate readback
+	// as the first modulated surface of a frame drawing with glColor 0.5,
+	// i.e. at half brightness for one frame.
+	glColor3f( 1.f, 1.f, 1.f );
 	SetBlend( Surface.PolyFlags );
 	UBOOL LightDone = 0;	// light map folded into the base pass below
 	if( Surface.Texture )
@@ -1628,6 +2396,42 @@ void UOpenGLRenderDevice::DrawComplexSurface( FSceneNode* Frame, FSurfaceInfo& S
 		// auto-panning cloud sheets, and those must keep sliding rigidly.
 		UBOOL Flowing = Translucent && Frame->Parent==NULL && !WavyFlags
 		             && (Surface.PolyFlags & (PF_AutoUPan|PF_AutoVPan))!=0;
+		// A liquid sheet standing UP is a WATERFALL, not a pool. Sliding a
+		// static picture down it was all a 1998 renderer could do, and treating
+		// it as a pool afterwards only adds ripples: it reads as a pane of
+		// glass hung in front of the rock. Recognise the standing sheet and
+		// shade it as falling water instead (the Fall path in InitWavyProgram).
+		//
+		// The test is GEOMETRY plus liquid-ness, and deliberately nothing else.
+		// Keying it on the auto-pan flag missed SkyTown's falls, which carry no
+		// pan at all; requiring PF_Translucent missed them too, since that map's
+		// water is opaque. What is left: it is wavy (mapper-flagged, or a
+		// WaterTexture that Render flags for them), it is tall, and it STANDS.
+		// Root frame only -- sky boxes hang auto-panning sheets of their own.
+		UBOOL Falling = WavyFlags && Frame->Parent==NULL && Facet.Bounds.IsValid;
+		if( Falling )
+		{
+			// Standing = the surface's own plane is near-vertical, so its
+			// normal lies near the horizontal. Taken off the NORMAL rather than
+			// the bounding box: SkyTown's fall is a slanted chute, 825 x 704 x
+			// 1280, and a box test calls that a pool. MapCoords is in eye space,
+			// so bring world up along to compare with.
+			FLOAT HZ = Facet.Bounds.Max.Z-Facet.Bounds.Min.Z;
+			FVector UpEye = FVector(0,0,1).TransformVectorBy( Frame->Coords );
+			FLOAT NL = Facet.MapCoords.ZAxis.Size();
+			FLOAT NZ = NL>0.0001f ? Abs( (UpEye | Facet.MapCoords.ZAxis)/NL ) : 1.f;
+			Falling = HZ >= 64.f && NZ <= 0.6f;
+		}
+		// An OPAQUE fall cannot use the shaping that assumes additive
+		// translucency: there, dark means see-through, so the edge fades and
+		// the strand gate open the sheet up. On an opaque surface the same
+		// arithmetic just paints it black. It keeps the strands and the foot.
+		UBOOL FallSolid = Falling && !Translucent;
+		// -probenofall shades falls as the pools they used to be taken for:
+		// the A/B for "is this sheet better as falling water or not".
+		static UBOOL NoFall = ParseParam( appCmdLine(), "PROBENOFALL" );
+		if( NoFall )
+			Falling = 0;
 		// Water look (glints, base fade, livelier time) is for translucent
 		// LIQUID surfaces; a merely lit-translucent sheet (below) gets none.
 		UBOOL WaterFX = Flowing || (WavyFlags && Translucent);
@@ -1639,13 +2443,13 @@ void UOpenGLRenderDevice::DrawComplexSurface( FSceneNode* Frame, FSurfaceInfo& S
 		// dim-lit waterfall rendered as a dark glassy slab over the scene
 		// behind it. Software-renderer translucency lit the texel, never the
 		// backdrop.
-		UBOOL Wavy = Flowing || WavyFlags || (Translucent && Surface.LightMap);
+		UBOOL Wavy = Flowing || WavyFlags || SkyCloud || (Translucent && Surface.LightMap);
 		if( Wavy && !WavyTried )
 			InitWavyProgram();
 		Wavy = Wavy && WavyProgram!=0;
 		UBOOL FoldLight = Wavy && Translucent && Surface.LightMap
 		               && ZglActiveTexture && ZglMultiTexCoord2f;
-		if( !WavyFlags && !Flowing && !FoldLight )
+		if( !WavyFlags && !Flowing && !SkyCloud && !FoldLight )
 			Wavy = 0;	// lit-translucent was the only reason, and it needs multitexture
 
 		// Fountain columns: mappers author a pour as several translucent
@@ -1757,6 +2561,52 @@ void UOpenGLRenderDevice::DrawComplexSurface( FSceneNode* Frame, FSurfaceInfo& S
 		}
 
 		SetTexture( *Surface.Texture, Surface.PolyFlags, 0 );
+		// -probeglstate: read the ACTUAL GL state back for modulated surfaces at
+		// the moment they draw, instead of reasoning about what it should be.
+		// Written after three texture-side fixes to the WaterRings2 pale box all
+		// failed the flat-neutral test -- the scale factor is in the pipeline
+		// state somewhere, and this prints the pipeline's own account of itself.
+		{
+			static UBOOL GLStateInfo = ParseParam( appCmdLine(), "PROBEGLSTATE" );
+			static INT GLStateLogged = 0;
+			if( GLStateInfo && (Surface.PolyFlags & PF_Modulated) && GLStateLogged<4 )
+			{
+				GLStateLogged++;
+				GLint BlendOn=0, SrcF=0, DstF=0, Prog=0, Tex=0, Env=0;
+				GLfloat Col[4]={0,0,0,0};
+				glGetIntegerv( GL_BLEND, &BlendOn );
+				glGetIntegerv( GL_BLEND_SRC, &SrcF );
+				glGetIntegerv( GL_BLEND_DST, &DstF );
+				glGetIntegerv( 0x8B8D /*GL_CURRENT_PROGRAM*/, &Prog );
+				glGetIntegerv( GL_TEXTURE_BINDING_2D, &Tex );
+				glGetTexEnviv( GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, &Env );
+				glGetFloatv( GL_CURRENT_COLOR, Col );
+				debugf( NAME_Log, "GLSTATE modulated: blend=%i src=%04X dst=%04X prog=%i tex=%i env=%04X color=(%.2f,%.2f,%.2f,%.2f)",
+					BlendOn, SrcF, DstF, Prog, Tex, Env, Col[0], Col[1], Col[2], Col[3] );
+				// And what is actually IN the bound texture: read back the top
+				// mip's centre row and report its min/mean/max. If the upload
+				// path corrected this texture, that shows here; if the box
+				// remains anyway, the scaling is downstream of the texture.
+				GLint W=0, H=0;
+				glGetTexLevelParameteriv( GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &W );
+				glGetTexLevelParameteriv( GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &H );
+				if( W>0 && W<=1024 && H>0 )
+				{
+					BYTE* Pix = (BYTE*)appMalloc( W*H*4, "GLStateProbe" );
+					glGetTexImage( GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, Pix );
+					INT Mn=255, Mx=0; DOUBLE Sum=0;
+					BYTE* Row = Pix + (H/2)*W*4;
+					for( INT x=0; x<W; x++ )
+					{
+						INT L = ( Row[x*4+0] + Row[x*4+1] + Row[x*4+2] + 1 ) / 3;
+						Sum += L; Mn = Min(Mn,L); Mx = Max(Mx,L);
+					}
+					debugf( NAME_Log, "GLSTATE   bound tex %ix%i centre row: min=%i mean=%.1f max=%i (modulate no-op=127.5)",
+						W, H, Mn, Sum/W, Mx );
+					appFree( Pix );
+				}
+			}
+		}
 		FLOAT BaseUM = UMult, BaseVM = VMult;
 		FLOAT LightUM = 0.f, LightVM = 0.f;
 		if( FoldLight )
@@ -1784,16 +2634,53 @@ void UOpenGLRenderDevice::DrawComplexSurface( FSceneNode* Frame, FSurfaceInfo& S
 			ALevelInfo* Info = Frame->Level ? Frame->Level->GetLevelInfo() : NULL;
 			T = Info ? (DOUBLE)Info->TimeSeconds : 0.0;
 			ZglUseProgram( WavyProgram );
-			ZglUniform1f( WavyLocTime, (FLOAT)fmod( WaterFX ? T*1.5 : T, 125.66370614359172 ) );
+			// Clouds evolve over half a minute, not half a second, so their
+			// time runs at an eighth. The wrap has to grow by the same factor to
+			// stay on a whole number of wave periods (every rate is a multiple
+			// of 0.05 rad/s, so 8 x 2pi/0.05 is still a multiple of 2pi).
+			ZglUniform1f( WavyLocTime, SkyCloud
+				? (FLOAT)fmod( T*0.125, 1005.3096491487338 )
+				: (FLOAT)fmod( WaterFX ? T*1.5 : T, 125.66370614359172 ) );
 			// Flowing surfaces warp gently (the pan supplies the motion);
 			// wavy pools use the tuned amplitudes; lit translucent sheets
 			// (fountain streams pouring from statues, and their kin) get a
 			// slight sway -- their procedural animation supplies the fall,
 			// the sway keeps the column from reading as a rigid slab.
-			ZglUniform1f( WavyLocAmp, Flowing ? 2.5f : WavyFlags ? ((Surface.PolyFlags & PF_BigWavy) ? 7.f : 3.5f) : 1.5f );
+			// Cloud sheets churn WIDE -- a whole cloud's worth of texels, where
+			// water ripples a few.
+			ZglUniform1f( WavyLocAmp, SkyCloud ? 9.f : Falling ? 2.f : Flowing ? 2.5f
+				: WavyFlags ? ((Surface.PolyFlags & PF_BigWavy) ? 7.f : 3.5f) : 1.5f );
 			ZglUniform2f( WavyLocUVMult, BaseUM, BaseVM );
-			ZglUniform1f( WavyLocGloss, WaterFX ? 0.22f : 0.15f );
-			ZglUniform1f( WavyLocBase,  WaterFX ? 0.88f : 1.f );
+			// A fall gets no pool glint (its slope field is the strand field,
+			// not a wave) and no base fade: the strand gate below decides what
+			// is water and what is a gap through it. Clouds get neither either.
+			// MODULATED surfaces get neither glint nor base fade, whatever else
+			// they are. Their texels are blend FACTORS (2*src*dst), not colours:
+			// the no-op is exactly 0.5, and ANY shading applied to them tints the
+			// framebuffer instead of lighting the surface. Gloss rides the wave
+			// slope by +-0.15, which on a modulate decal is +-7.5% brightness
+			// smeared over the whole quad -- and since the quad is a mapper's
+			// brush, that reads as a hard-edged pale BOX. NyLeve's WaterRings2
+			// ripple decal is a WaveTexture, so Render tags it PF_SmallWavy and it
+			// arrives here as "a liquid surface"; it is a decal, and the shading a
+			// pool wants is exactly what it must not have. Proved by forcing the
+			// texture to a flat neutral 128, which must be invisible under this
+			// blend: the box did not change at all, so it was never the texture.
+			// The WARP still applies -- displacing the rings is the point of it.
+			UBOOL ModDecal = (Surface.PolyFlags & PF_Modulated)!=0;
+			{
+				static UBOOL PassInfo = ParseParam( appCmdLine(), "PROBEPASSINFO" );
+				static INT PassLogged = 0;
+				if( PassInfo && ModDecal && PassLogged<6 )
+				{
+					PassLogged++;
+					debugf( NAME_Log, "PASSPROBE modulated surf flags=%08X lightmap=%i detail=%i macro=%i fog=%i bump=%i",
+						Surface.PolyFlags, Surface.LightMap!=NULL, Surface.DetailTexture!=NULL,
+						Surface.MacroTexture!=NULL, Surface.FogMap!=NULL, Surface.BumpMap!=NULL );
+				}
+			}
+			ZglUniform1f( WavyLocGloss, (Falling || SkyCloud || ModDecal) ? 0.f : WaterFX ? 0.22f : 0.15f );
+			ZglUniform1f( WavyLocBase,  (Falling || SkyCloud || ModDecal) ? 1.f : WaterFX ? 0.88f : 1.f );
 			ZglUniform1f( WavyLocLightOn, FoldLight ? 1.f : 0.f );
 			// Ordinary surfaces: no stream shaping. (The fountain path sets
 			// its own uniforms right before drawing, below.)
@@ -1803,6 +2690,72 @@ void UOpenGLRenderDevice::DrawComplexSurface( FSceneNode* Frame, FSurfaceInfo& S
 			ZglUniform1f( WavyLocScroll, 0.f );
 			ZglUniform1f( WavyLocBlob, 0.f );
 			ZglUniform1f( WavyLocFoam, 0.f );
+			ZglUniform1f( WavyLocFall, 0.f );
+			ZglUniform1f( WavyLocFallDn, 1.f );
+			ZglUniform1f( WavyLocFallFd, 0.f );
+			ZglUniform1f( WavyLocFallSol, 0.f );
+			if( Falling )
+			{
+				// Which way is DOWN on this face, in the texture's own axes:
+				// the world down vector resolved onto them (both are in eye
+				// space here, so bring down along too). Falls are authored with
+				// one texture axis running down the face, so the dominant one is
+				// the flow axis and its sign says which end is the foot.
+				FVector DownEye = FVector(0,0,-1).TransformVectorBy( Frame->Coords );
+				FLOAT DU = Facet.MapCoords.XAxis | DownEye;
+				FLOAT DV = Facet.MapCoords.YAxis | DownEye;
+				FLOAT SU = Facet.MapCoords.XAxis.Size(), SV = Facet.MapCoords.YAxis.Size();
+				FLOAT CU = SU>0.0001f ? Abs(DU)/SU : 0.f;	// |cos| to the U axis
+				FLOAT CV = SV>0.0001f ? Abs(DV)/SV : 0.f;
+				UBOOL AlongV = CV >= CU;
+				FLOAT Down = AlongV ? DV : DU;
+
+				// Texel extents of the WHOLE surface, from its unclipped world
+				// box (the polys handed to us are clipped to the view, so their
+				// extent would shrink as the fall leaves frame and the edge
+				// fades would crawl across it). A rigid transform, so the texel
+				// values a box corner maps to do not depend on the camera.
+				FLOAT UMin=99999999.f, UMax=-99999999.f, VMin=99999999.f, VMax=-99999999.f;
+				for( INT c=0; c<8; c++ )
+				{
+					FVector W( (c&1) ? Facet.Bounds.Max.X : Facet.Bounds.Min.X,
+					           (c&2) ? Facet.Bounds.Max.Y : Facet.Bounds.Min.Y,
+					           (c&4) ? Facet.Bounds.Max.Z : Facet.Bounds.Min.Z );
+					FVector E = W.TransformPointBy( Frame->Coords ) - Facet.MapCoords.Origin;
+					FLOAT U = Facet.MapCoords.XAxis | E;
+					FLOAT V = Facet.MapCoords.YAxis | E;
+					UMin = Min(UMin,U); UMax = Max(UMax,U);
+					VMin = Min(VMin,V); VMax = Max(VMax,V);
+				}
+				// Same texcoord units the vertices carry, pan included.
+				ZglUniform2f( WavyLocUEdge, (UMin-Surface.Texture->Pan.X)*BaseUM, (UMax-Surface.Texture->Pan.X)*BaseUM );
+				ZglUniform2f( WavyLocVEdge, (VMin-Surface.Texture->Pan.Y)*BaseVM, (VMax-Surface.Texture->Pan.Y)*BaseVM );
+				ZglUniform1f( WavyLocFlowV, AlongV ? 1.f : 0.f );
+				ZglUniform1f( WavyLocBlob, 3.f );
+				ZglUniform1f( WavyLocFall, 1.f );
+				ZglUniform1f( WavyLocFallDn, Down >= 0.f ? 1.f : -1.f );
+				ZglUniform1f( WavyLocFallSol, FallSolid ? 1.f : 0.f );
+				// Does it land in anything? A fall spilling off a ledge into a
+				// sky box lands in NOTHING, and must dissolve well before the
+				// sheet's bottom edge rather than being brightened at it.
+				FLOAT FootZ = 0.f;
+				FVector FootMid( (Facet.Bounds.Min.X+Facet.Bounds.Max.X)*0.5f,
+				                 (Facet.Bounds.Min.Y+Facet.Bounds.Max.Y)*0.5f, Facet.Bounds.Min.Z );
+				ZglUniform1f( WavyLocFallFd,
+					ZFallLandsInWater( Frame, FootMid,
+						FVector( Max( (Facet.Bounds.Max.X-Facet.Bounds.Min.X)*0.5f, 24.f ),
+						         Max( (Facet.Bounds.Max.Y-Facet.Bounds.Min.Y)*0.5f, 24.f ), 0.f ),
+						Facet.Bounds.Min.Z, FootZ ) ? 0.f : 1.f );
+				// Speed. The zone's auto-pan is 35 texels/s, tuned for sliding
+				// clouds, and water falling a room's height at that rate reads
+				// as a picture creeping downward. Scroll the lookup along the
+				// fall on top of it, wrapped at the texture's own size along
+				// that axis so the wrap lands exactly on a repeat.
+				FLOAT TexSz = (FLOAT)Max( 1, AlongV ? Surface.Texture->VSize : Surface.Texture->USize );
+				FLOAT Mult  = AlongV ? BaseVM : BaseUM;
+				FLOAT Slide = (FLOAT)fmod( T*130.0, (DOUBLE)TexSz )*Mult;
+				ZglUniform1f( WavyLocScroll, Down >= 0.f ? Slide : -Slide );
+			}
 		}
 		glColor3f( 1.f, 1.f, 1.f );
 		if( StreamLook && Col )
@@ -1991,10 +2944,10 @@ void UOpenGLRenderDevice::DrawComplexSurface( FSceneNode* Frame, FSurfaceInfo& S
 				else              { DX = 0.f;  DY = 1.f; }
 				FLOAT LX = DX*R*Stretch, LY = DY*R*Stretch;	// along the fall
 				FLOAT WX = -DY*R,        WY = DX*R;			// across it
-				glTexCoord2f( SU0, SV0 ); glVertex3f( Pp.X-LX-WX, Pp.Y-LY-WY, Pp.Z );
-				glTexCoord2f( SU1, SV0 ); glVertex3f( Pp.X-LX+WX, Pp.Y-LY+WY, Pp.Z );
-				glTexCoord2f( SU1, SV1 ); glVertex3f( Pp.X+LX+WX, Pp.Y+LY+WY, Pp.Z );
-				glTexCoord2f( SU0, SV1 ); glVertex3f( Pp.X+LX-WX, Pp.Y+LY-WY, Pp.Z );
+				glTexCoord3f( SU0, SV0, H3 ); glVertex3f( Pp.X-LX-WX, Pp.Y-LY-WY, Pp.Z );
+				glTexCoord3f( SU1, SV0, H3 ); glVertex3f( Pp.X-LX+WX, Pp.Y-LY+WY, Pp.Z );
+				glTexCoord3f( SU1, SV1, H3 ); glVertex3f( Pp.X+LX+WX, Pp.Y+LY+WY, Pp.Z );
+				glTexCoord3f( SU0, SV1, H3 ); glVertex3f( Pp.X+LX-WX, Pp.Y+LY-WY, Pp.Z );
 			}
 			glEnd();
 			PolyCount++;
@@ -2123,10 +3076,10 @@ void UOpenGLRenderDevice::DrawComplexSurface( FSceneNode* Frame, FSurfaceInfo& S
 					if( E0.Z<1.f || E1.Z<1.f || E2.Z<1.f || E3.Z<1.f )
 						continue;
 					glColor3f( Af, Af, Af );
-					glTexCoord2f( SU0, SV0 ); glVertex3f( E0.X, E0.Y, E0.Z );
-					glTexCoord2f( SU1, SV0 ); glVertex3f( E1.X, E1.Y, E1.Z );
-					glTexCoord2f( SU1, SV1 ); glVertex3f( E2.X, E2.Y, E2.Z );
-					glTexCoord2f( SU0, SV1 ); glVertex3f( E3.X, E3.Y, E3.Z );
+					glTexCoord3f( SU0, SV0, G3 ); glVertex3f( E0.X, E0.Y, E0.Z );
+					glTexCoord3f( SU1, SV0, G3 ); glVertex3f( E1.X, E1.Y, E1.Z );
+					glTexCoord3f( SU1, SV1, G3 ); glVertex3f( E2.X, E2.Y, E2.Z );
+					glTexCoord3f( SU0, SV1, G3 ); glVertex3f( E3.X, E3.Y, E3.Z );
 				}
 				glEnd();
 				PolyCount++;
@@ -2154,6 +3107,11 @@ void UOpenGLRenderDevice::DrawComplexSurface( FSceneNode* Frame, FSurfaceInfo& S
 				glEnd();
 				PolyCount++;
 			}
+			// A fall that ends in water gets froth, wakes and spray where it
+			// lands (see DrawFallFoot) -- drawn with the same program still
+			// bound, right after the sheet itself.
+			if( Falling && Wavy )
+				DrawFallFoot( Frame, Surface, Facet, T, BaseUM, BaseVM, FoldLight, LightUM, LightVM );
 		}
 		if( Wavy )
 			ZglUseProgram( 0 );
@@ -2245,7 +3203,7 @@ void UOpenGLRenderDevice::DrawComplexSurface( FSceneNode* Frame, FSurfaceInfo& S
 	// detail blend (UnGlide.cpp): the verts are already in Unreal eye space, so
 	// Point.Z is the view-forward depth. The texture-combine interpolates the
 	// detail texel toward neutral gray (0.5) by a per-vertex distance alpha, and
-	// the whole pass is 2x-modulated — so far surfaces multiply by ~1.0 (no-op)
+	// the whole pass is 2x-modulated ??? so far surfaces multiply by ~1.0 (no-op)
 	// while near surfaces get the detail. (DetailTexture was nulled above when a
 	// fog map is present, so the two are mutually exclusive as in the original.)
 	if( Surface.DetailTexture && DetailTextures )
@@ -2321,7 +3279,11 @@ void UOpenGLRenderDevice::DrawComplexSurface( FSceneNode* Frame, FSurfaceInfo& S
 	}
 
 	// Pass 3: fog map, additive over the lit surface.
-	if( Surface.FogMap )
+	// -probenofogmap drops this pass: a translucent surface takes it on top of
+	// its own additive blend, so a strongly volumetric-lit sheet can be washed
+	// flat by fog it is easy to mistake for the surface's own colour.
+	static UBOOL NoFogMap = ParseParam( appCmdLine(), "PROBENOFOGMAP" );
+	if( Surface.FogMap && !NoFogMap )
 	{
 		glDisable( GL_ALPHA_TEST );
 		glEnable( GL_BLEND );

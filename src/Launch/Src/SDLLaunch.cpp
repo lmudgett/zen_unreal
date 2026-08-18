@@ -464,6 +464,53 @@ static void RunActorProbe( UEngine* Engine )
 }
 
 /*-----------------------------------------------------------------------------
+	Mesh animation probe (-probemeshanim).
+-----------------------------------------------------------------------------*/
+
+// -probemeshanim[=<substr>] dumps the animation sequences a mesh actually
+// carries: which frames each sequence covers, its rate, and its notifies.
+// Sequences are declared by #exec MESH SEQUENCE in script and BAKED INTO THE
+// PACKAGE, so a package rebuilt from source can disagree with what the script
+// says -- and a sequence pointing at the wrong frames is an animation that
+// plays the wrong thing while every line of code involved looks correct.
+// Comparing this against the #exec lines is the only way to tell.
+static void RunMeshAnimProbe()
+{
+	guard(RunMeshAnimProbe);
+	char Filter[64]="";
+	Parse( appCmdLine(), "PROBEMESHANIM=", Filter, ARRAY_COUNT(Filter) );
+	// Meshes load on demand with the classes that reference them, so a map that
+	// happens not to contain the weapon has none of its meshes in memory. Load
+	// the package outright (-probemeshpkg, default UnrealI) so the dump covers
+	// what the package actually shipped rather than what this level touched.
+	char Pkg[64]="UnrealI";
+	Parse( appCmdLine(), "PROBEMESHPKG=", Pkg, ARRAY_COUNT(Pkg) );
+	if( !GObj.LoadPackage( NULL, Pkg, LOAD_NoWarn ) )
+		debugf( NAME_Log, "MESHANIM: could not load package '%s'", Pkg );
+	INT Logged=0;
+	for( TObjectIterator<UMesh> It; It; ++It )
+	{
+		UMesh* M = *It;
+		if( Filter[0] && !appStrfind( const_cast<char*>(M->GetName()), Filter ) )
+			continue;
+		debugf( NAME_Log, "MESHANIM %s: %i sequence(s), %i frames total",
+			M->GetPathName(), M->AnimSeqs.Num(), M->FrameVerts ? M->AnimFrames : 0 );
+		for( INT i=0; i<M->AnimSeqs.Num(); i++ )
+		{
+			FMeshAnimSeq& S = M->AnimSeqs(i);
+			debugf( NAME_Log, "MESHANIM    %-12s start=%-4i frames=%-4i rate=%-6.1f group=%-10s notifies=%i",
+				*S.Name, S.StartFrame, S.NumFrames, S.Rate, *S.Group, S.Notifys.Num() );
+			for( INT n=0; n<S.Notifys.Num(); n++ )
+				debugf( NAME_Log, "MESHANIM       notify time=%.3f -> %s",
+					S.Notifys(n).Time, *S.Notifys(n).Function );
+		}
+		Logged++;
+	}
+	debugf( NAME_Log, "MESHANIM: %i mesh(es) logged (filter '%s')", Logged, Filter );
+	unguard;
+}
+
+/*-----------------------------------------------------------------------------
 	Creature AI audit (-probeai).
 -----------------------------------------------------------------------------*/
 
@@ -969,6 +1016,79 @@ static void RunSurfProbe( UEngine* Engine )
 			(TalFlags[t] & PF_BigWavy    ) ? " BIGWAVY" : "" );
 	}
 	debugf( NAME_Log, "SURFPROBE: %i unique (texture,flags) pairs over %i surfs", NumTally, Model->Surfs->Num() );
+
+	// -probesurfsat=<texture substring> additionally dumps each matching
+	// surface on its own: the whole unclipped world box (as Render's
+	// GetSurfBounds computes it) plus its extents. The tally above says WHAT a
+	// liquid is; this says what SHAPE the mapper built it as -- a single tall
+	// sheet, or the four walls of a box -- which is what decides how the driver
+	// should treat it.
+	char At[64]="";
+	if( Parse( appCmdLine(), "PROBESURFSAT=", At, ARRAY_COUNT(At) ) && At[0] )
+	{
+		TArray<FBox> Bounds;
+		Bounds.Add( Model->Surfs->Num() );
+		for( INT i=0; i<Bounds.Num(); i++ )
+			Bounds(i) = FBox(0);
+		// Texture-space extent too, in texels: how many TILES of its texture a
+		// surface spans. A texture drawn once reads as the picture the artist
+		// painted; the same texture wrapped several times puts its bottom row
+		// against its top row at every seam, and if the art is not tileable that
+		// seam is a hard luminance step -- which on a translucent sheet reads as
+		// a straight bright edge cutting across it.
+		TArray<FLOAT> UMin, UMax, VMin, VMax;
+		UMin.Add( Model->Surfs->Num() ); UMax.Add( Model->Surfs->Num() );
+		VMin.Add( Model->Surfs->Num() ); VMax.Add( Model->Surfs->Num() );
+		for( INT i=0; i<Model->Surfs->Num(); i++ )
+		{
+			UMin(i) = VMin(i) =  1e30f;
+			UMax(i) = VMax(i) = -1e30f;
+		}
+		for( INT n=0; n<Model->Nodes->Num(); n++ )
+		{
+			FBspNode& Node = Model->Nodes->Element(n);
+			if( Node.NumVertices<3 || Node.iSurf<0 || Node.iSurf>=Bounds.Num() )
+				continue;
+			FBox& B = Bounds(Node.iSurf);
+			FBspSurf& S = Model->Surfs->Element( Node.iSurf );
+			FVector Base = Model->Points->Element( S.pBase );
+			FVector TexU = Model->Vectors->Element( S.vTextureU );
+			FVector TexV = Model->Vectors->Element( S.vTextureV );
+			for( INT v=0; v<Node.NumVertices; v++ )
+			{
+				FVector P = Model->Points->Element( Model->Verts->Element(Node.iVertPool+v).pVertex );
+				B += P;
+				FLOAT U = TexU | (P-Base), V = TexV | (P-Base);
+				UMin(Node.iSurf) = Min( UMin(Node.iSurf), U );
+				UMax(Node.iSurf) = Max( UMax(Node.iSurf), U );
+				VMin(Node.iSurf) = Min( VMin(Node.iSurf), V );
+				VMax(Node.iSurf) = Max( VMax(Node.iSurf), V );
+			}
+		}
+		INT Hits=0;
+		for( INT i=0; i<Model->Surfs->Num(); i++ )
+		{
+			FBspSurf& Surf = Model->Surfs->Element(i);
+			if( !Surf.Texture || !Bounds(i).IsValid )
+				continue;
+			// "*" lists every surface, so a spot can be interrogated by POSITION
+			// rather than by guessing which texture is the one misbehaving --
+			// filter the boxes afterwards. Hunting a decal by name first means
+			// knowing the answer before you start.
+			if( appStrcmp( At, "*" )!=0 && !appStrfind( const_cast<char*>(Surf.Texture->GetName()), At ) )
+				continue;
+			FVector Mn = Bounds(i).Min, Mx = Bounds(i).Max;
+			FLOAT TilesU = Surf.Texture->USize>0 && UMax(i)>UMin(i) ? (UMax(i)-UMin(i))/Surf.Texture->USize : 0.f;
+			FLOAT TilesV = Surf.Texture->VSize>0 && VMax(i)>VMin(i) ? (VMax(i)-VMin(i))/Surf.Texture->VSize : 0.f;
+			debugf( NAME_Log, "SURFPROBE AT %-3i %-24s flags=%08X box=(%7.0f,%8.0f,%7.0f)..(%7.0f,%8.0f,%7.0f) HX=%4.0f HY=%4.0f HZ=%4.0f tex=%ix%i tiles=%.2fx%.2f",
+				i, Surf.Texture->GetName(), Surf.PolyFlags,
+				Mn.X, Mn.Y, Mn.Z, Mx.X, Mx.Y, Mx.Z,
+				Mx.X-Mn.X, Mx.Y-Mn.Y, Mx.Z-Mn.Z,
+				Surf.Texture->USize, Surf.Texture->VSize, TilesU, TilesV );
+			Hits++;
+		}
+		debugf( NAME_Log, "SURFPROBE: %i surface(s) matching '%s'", Hits, At );
+	}
 	unguard;
 }
 
@@ -1265,7 +1385,7 @@ static void MainLoop( UEngine* Engine )
 	// stops is where the game actually blocks. Screenshot + exit at the end.
 	FVector	WalkStart(0,0,0);
 	INT		WalkYaw = 0;
-	UBOOL	ProbeWalk = 0, WalkPlaced = 0;
+	UBOOL	ProbeWalk = 0, WalkPlaced = 0, ProbeStand = 0, ProbeIdle = 0;
 	{
 		char Spec[256]="";
 		if( Parse( appCmdLine(), "PROBEWALK=", Spec, ARRAY_COUNT(Spec) ) )
@@ -1280,6 +1400,46 @@ static void MainLoop( UEngine* Engine )
 					X,Y,Z, WalkYaw, ProbeFrames );
 			}
 			else debugf( NAME_Log, "PROBEWALK: need -probewalk=x:y:z:yaw (got '%s')", Spec );
+		}
+		// -probestand=x:y:z:yaw is -probewalk without the walking: a real player
+		// pawn, collision intact so pickups still work, but standing still.
+		// Needed because a weapon's idle state branches on the owner's speed --
+		// a walking player plays the walk animation and never reaches the idle
+		// behaviour (the BioRifle's drip, a weapon's twiddle), so those can only
+		// be observed by standing. -probeview cannot stand in for this: it pins
+		// the actor with collision off, and a player who cannot touch anything
+		// cannot pick a weapon up.
+		else if( Parse( appCmdLine(), "PROBESTAND=", Spec, ARRAY_COUNT(Spec) ) )
+		{
+			FLOAT X,Y,Z;
+			if( sscanf( Spec, "%f:%f:%f:%i", &X,&Y,&Z, &WalkYaw )==4 )
+			{
+				WalkStart = FVector(X,Y,Z);
+				ProbeWalk = 1;
+				ProbeStand = 1;
+				Parse( appCmdLine(), "PROBEFRAMES=", ProbeFrames );
+				debugf( NAME_Log, "PROBESTAND: standing at (%.0f,%.0f,%.0f) yaw=%i for %i frames",
+					X,Y,Z, WalkYaw, ProbeFrames );
+			}
+			else debugf( NAME_Log, "PROBESTAND: need -probestand=x:y:z:yaw (got '%s')", Spec );
+		}
+		// -probeidle=x:y:z:yaw places a real player and then LEAVES IT ALONE:
+		// no input, no velocity written, nothing forced per frame. The one way
+		// to answer "does a player standing still stay still", which -probestand
+		// cannot because it zeroes the velocity every frame.
+		else if( Parse( appCmdLine(), "PROBEIDLE=", Spec, ARRAY_COUNT(Spec) ) )
+		{
+			FLOAT X,Y,Z;
+			if( sscanf( Spec, "%f:%f:%f:%i", &X,&Y,&Z, &WalkYaw )==4 )
+			{
+				WalkStart = FVector(X,Y,Z);
+				ProbeWalk = 1;
+				ProbeIdle = 1;
+				Parse( appCmdLine(), "PROBEFRAMES=", ProbeFrames );
+				debugf( NAME_Log, "PROBEIDLE: idling at (%.0f,%.0f,%.0f) yaw=%i for %i frames",
+					X,Y,Z, WalkYaw, ProbeFrames );
+			}
+			else debugf( NAME_Log, "PROBEIDLE: need -probeidle=x:y:z:yaw (got '%s')", Spec );
 		}
 	}
 
@@ -1448,16 +1608,58 @@ static void MainLoop( UEngine* Engine )
 				{
 					WalkPlaced = 1;
 					G->GLevel->FarMoveActor( P, WalkStart, 0, 1 );
+					if( ProbeIdle )
+					{
+						// Aim it once, then never write to it again.
+						P->Physics      = PHYS_Walking;
+						P->Rotation.Yaw = P->ViewRotation.Yaw = WalkYaw;
+						P->Velocity     = FVector(0,0,0);
+						P->Acceleration = FVector(0,0,0);
+					}
 					debugf( NAME_Log, "PROBEWALK: placed at (%.0f,%.0f,%.0f)", P->Location.X, P->Location.Y, P->Location.Z );
 				}
 				FLOAT A = WalkYaw * (2.f*PI/65536.f);
 				FVector Dir( appCos(A), appSin(A), 0.f );
+				if( ProbeIdle )
+				{
+					// x64 port: IDLE is the one mode that must not touch the pawn
+					// after placing it. -probestand rewrites Velocity and
+					// Acceleration to zero every frame, which is precisely the
+					// state a drift bug would be hiding in -- it cannot show
+					// whether a player left alone STAYS put. Here the physics runs
+					// untouched and the log reports what it did, to a resolution
+					// that makes a slow creep obvious.
+					if( ( FrameNum % 25 )==0 || FrameNum==ProbeFrames-1 )
+						debugf( NAME_Log, "PROBEIDLE: frame %3i at (%.3f,%.3f,%.3f) vel=(%.4f,%.4f,%.4f) accel=(%.3f,%.3f,%.3f) phys=%i base=%s zone=%s friction=%.2f gravityZ=%.1f dt=%.5f",
+							FrameNum, P->Location.X, P->Location.Y, P->Location.Z,
+							P->Velocity.X, P->Velocity.Y, P->Velocity.Z,
+							P->Acceleration.X, P->Acceleration.Y, P->Acceleration.Z,
+							(INT)P->Physics, P->Base ? P->Base->GetName() : "none",
+							P->Region.Zone ? P->Region.Zone->GetName() : "none",
+							P->Region.Zone ? P->Region.Zone->ZoneGroundFriction : -1.f,
+							P->Region.Zone ? P->Region.Zone->ZoneGravity.Z : 0.f,
+							G->GLevel ? G->GLevel->GetLevelInfo()->TimeSeconds : 0.f );
+				}
+				else
+				{
 				P->Physics      = PHYS_Walking;
 				P->Rotation.Yaw = P->ViewRotation.Yaw = WalkYaw;
-				P->Velocity     = Dir * P->GroundSpeed + FVector(0,0,P->Velocity.Z);
-				P->Acceleration = Dir * P->AccelRate;
+				if( ProbeStand )
+				{
+					// Stand: keep the horizontal velocity at rest so weapon and
+					// pawn idle behaviour runs, but leave gravity alone.
+					P->Velocity     = FVector( 0, 0, P->Velocity.Z );
+					P->Acceleration = FVector( 0, 0, 0 );
+				}
+				else
+				{
+					P->Velocity     = Dir * P->GroundSpeed + FVector(0,0,P->Velocity.Z);
+					P->Acceleration = Dir * P->AccelRate;
+				}
 				if( ( FrameNum % 25 )==0 || FrameNum==ProbeFrames-1 )
-					debugf( NAME_Log, "PROBEWALK: frame %3i at (%.0f,%.0f,%.0f)", FrameNum, P->Location.X, P->Location.Y, P->Location.Z );
+					debugf( NAME_Log, "%s: frame %3i at (%.0f,%.0f,%.0f)",
+						ProbeStand ? "PROBESTAND" : "PROBEWALK", FrameNum, P->Location.X, P->Location.Y, P->Location.Z );
+				}
 			}
 			// -probeshotevery=N applies here too, not just to the pinned view:
 			// a walked sequence of consecutive frames is what shows temporal
@@ -1628,6 +1830,58 @@ static void MainLoop( UEngine* Engine )
 			}
 		}
 
+		// -probeholdfire[=<Weapon class>] holds the trigger down. Weapon state
+		// machines are where sound and animation bugs live -- a clip change, a
+		// reload, an eject -- and none of them can be reached by spawning
+		// actors or pinning a camera: something has to actually work the gun.
+		// The optional class is given to the player first (summoned into the
+		// world at their feet, which the pickup logic then hands over).
+		{
+			static UBOOL   HoldFire   = 0;
+			static UBOOL   HoldInit   = 0;
+			static char    HoldWeapon[64] = "";
+			if( !HoldInit )
+			{
+				HoldInit = 1;
+				// -probeholdfire[=<Weapon>] equips (optionally) and holds the
+				// trigger; -probegive=<Weapon> only equips. Idle behaviour --
+				// a weapon's twiddle, the BioRifle's drip -- only runs when the
+				// trigger is NOT held, so the two have to be separable.
+				HoldFire = ParseParam( appCmdLine(), "PROBEHOLDFIRE" );
+				Parse( appCmdLine(), "PROBEHOLDFIRE=", HoldWeapon, ARRAY_COUNT(HoldWeapon) );
+				Parse( appCmdLine(), "PROBEGIVE=", HoldWeapon, ARRAY_COUNT(HoldWeapon) );
+				if( HoldWeapon[0] && Engine->Client && Engine->Client->Viewports.Num() )
+				{
+					// Spawn it ON the player, not via the summon console command:
+					// summon drops the weapon some way in FRONT of the player, so
+					// a stationary test never touches it and never picks it up.
+					UGameEngine* WG = Cast<UGameEngine>( Engine );
+					APlayerPawn* WP = Engine->Client->Viewports(0)->Actor;
+					UClass* WC = FindObject<UClass>( ANY_PACKAGE, HoldWeapon );
+					if( !WC )
+						WC = GObj.LoadClass( AActor::StaticClass, NULL, HoldWeapon, NULL, LOAD_NoWarn|LOAD_KeepImports, NULL );
+					AActor* W = (WC && WG && WG->GLevel && WP)
+						? WG->GLevel->SpawnActor( WC, NAME_None, NULL, NULL, WP->Location, WP->Rotation, NULL, 0, 1 )
+						: NULL;
+					// And hand it over: touch detection fires on MOVEMENT, so a
+					// pickup spawned already overlapping a stationary player is
+					// never noticed. Calling Touch directly is what the engine
+					// would have called had the player walked onto it.
+					if( W && WP )
+						W->eventTouch( WP );
+					debugf( NAME_Log, "PROBEHOLDFIRE: %s %s at the player",
+						W ? "spawned and handed over" : "FAILED to spawn", HoldWeapon );
+				}
+			}
+			if( HoldFire && Engine->Client )
+				for( INT v=0; v<Engine->Client->Viewports.Num(); v++ )
+				{
+					APlayerPawn* P = Engine->Client->Viewports(v)->Actor;
+					if( P )
+						P->bFire = 1;
+				}
+		}
+
 		char ProbeExec[128]="";
 		UBOOL HasExec = Parse( appCmdLine(), "PROBEEXEC=", ProbeExec, ARRAY_COUNT(ProbeExec) );
 		if( !ProbeWalk && (PinView || HasExec || ProbeFx) && Engine->Client )
@@ -1696,7 +1950,21 @@ static void MainLoop( UEngine* Engine )
 							ProbeFxLoc.X, ProbeFxLoc.Y, ProbeFxLoc.Z,
 							Hit.Time<1.f ? (Hit.Location-Eye).Size() : -1.f, (INT)ProbeFxFire );
 					}
+					// Find it if it is already in memory, LOAD it if not: a class
+					// is only resident once something in the map has referenced
+					// it, so probing an effect in a level that happens not to
+					// contain the weapon that spawns it would otherwise fail
+					// with "not found". Qualified names (UnrealI.ShellCase) load
+					// straight; bare ones are retried against the game package.
 					UClass* C = FindObject<UClass>( ANY_PACKAGE, ProbeFxName );
+					if( !C )
+						C = GObj.LoadClass( AActor::StaticClass, NULL, ProbeFxName, NULL, LOAD_NoWarn|LOAD_KeepImports, NULL );
+					if( !C && !appStrchr( ProbeFxName, '.' ) )
+					{
+						char Qualified[128];
+						appSprintf( Qualified, "UnrealI.%s", ProbeFxName );
+						C = GObj.LoadClass( AActor::StaticClass, NULL, Qualified, NULL, LOAD_NoWarn|LOAD_KeepImports, NULL );
+					}
 					APawn* Shooter = ProbeFxFire ? (APawn*)Engine->Client->Viewports(0)->Actor : NULL;
 					AActor* A = C ? G->GLevel->SpawnActor( C, NAME_None, Shooter, Shooter, ProbeFxLoc, ProbeFxRot, NULL, 0, 1 ) : NULL;
 					if( A )
@@ -1731,10 +1999,26 @@ static void MainLoop( UEngine* Engine )
 			if( ShotEvery > 0 && FrameNum >= ProbeFrames/2 && FrameNum < ProbeFrames && ((ProbeFrames-FrameNum) % ShotEvery)==0 )
 				for( INT v=0; v<Engine->Client->Viewports.Num(); v++ )
 					Engine->Client->Viewports(v)->Exec( "SHOT", GSystem );
+			// -probeexec runs -probeexeclead frames BEFORE the shot, so whatever
+			// it does is on screen by the time the shot is taken. Running it in
+			// the same frame captured the view as it was BEFORE the command --
+			// a command that opens a menu, say, showed no menu at all.
+			INT ExecLead = 8;
+			Parse( appCmdLine(), "PROBEEXECLEAD=", ExecLead );
+			if( HasExec && FrameNum == Max( 1, ProbeFrames-ExecLead ) )
+			{
+				// Through the VIEWPORT first: that is what reaches the player
+				// pawn's own exec functions (ShowLoadMenu and its kin). Only
+				// engine-level commands fall through to the engine itself.
+				UBOOL Handled = 0;
+				for( INT v=0; v<Engine->Client->Viewports.Num(); v++ )
+					if( Engine->Client->Viewports(v)->Exec( ProbeExec, GSystem ) )
+						Handled = 1;
+				if( !Handled )
+					Engine->Exec( ProbeExec, GSystem );
+			}
 			if( FrameNum == ProbeFrames )
 			{
-				if( HasExec )
-					Engine->Exec( ProbeExec, GSystem );
 				for( INT v=0; v<Engine->Client->Viewports.Num(); v++ )
 					Engine->Client->Viewports(v)->Exec( "SHOT", GSystem );
 				debugf( NAME_Log, "PROBEVIEW: screenshot taken, exiting" );
@@ -1891,6 +2175,11 @@ int main( int argc, char** argv )
 			if( !GIsRequestingExit && ParseParam( appCmdLine(), "PROBESURFS" ) )
 			{
 				RunSurfProbe( Engine );
+				GIsRequestingExit = 1;
+			}
+			if( !GIsRequestingExit && ParseParam( appCmdLine(), "PROBEMESHANIM" ) )
+			{
+				RunMeshAnimProbe();
 				GIsRequestingExit = 1;
 			}
 			if( !GIsRequestingExit && ParseParam( appCmdLine(), "PROBEFOUNTAINS" ) )

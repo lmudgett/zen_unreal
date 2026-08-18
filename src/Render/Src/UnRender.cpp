@@ -2607,9 +2607,9 @@ static void GAddCorona( FSceneNode* Frame, FCoronaLight* CoronaLights, INT& iFre
 // fountain particle emitters from it) cannot recover it from them. Built in
 // one pass over the nodes on first use per model and cached: a level load
 // costs one scan, every later frame costs an array index.
-static UModel*       GSurfBoundsModel = NULL;
-static TArray<FBox>  GSurfBounds;
-static INT           GSurfBoundsNodes = -1, GSurfBoundsPoints = -1;
+static UModel*         GSurfBoundsModel = NULL;
+static TArray<FBox>    GSurfBounds;
+static INT             GSurfBoundsNodes = -1, GSurfBoundsPoints = -1;
 
 static FBox GetSurfBounds( UModel* Model, INT iSurf )
 {
@@ -2780,6 +2780,39 @@ void URender::DrawFrame( FSceneNode* Frame )
 			// Make TextureMap.
 			FTextureInfo TextureMap;
 			UTexture* Texture		= Surf->Texture ? Surf->Texture->Get(Viewport->CurrentTime) : Viewport->Actor->Level->DefaultTexture;
+
+			// x64 port: -probehide=Name1,Name2 drops every surface wearing one of
+			// those textures. Telling overlapping translucent sheets apart by eye
+			// is guesswork -- a mapper's mist brush, a ripple decal and the fall
+			// itself all pile up at a waterfall's foot -- and hiding one at a time
+			// settles which is which in a single screenshot. Checked here, before
+			// any lighting is set up, so dropping a surface cannot strand a
+			// SetupForSurf without its FinishSurf. Whole-name match, ignoring case.
+			static char HideBuf[256];
+			static UBOOL HideParsed = 0, HaveHide = 0;
+			if( !HideParsed )
+			{
+				HideParsed = 1;
+				HaveHide = Parse( appCmdLine(), "PROBEHIDE=", HideBuf, ARRAY_COUNT(HideBuf) );
+			}
+			UBOOL Hidden = 0;
+			if( HaveHide )
+			{
+				const char* TexName = Texture->GetName();
+				INT NameLen = appStrlen( TexName );
+				for( const char* S=HideBuf; *S && !Hidden; )
+				{
+					const char* E = S;
+					while( *E && *E!=',' ) E++;
+					INT Len = (INT)(E-S);
+					if( Len==NameLen && appStrnicmp(TexName,S,Len)==0 )
+						Hidden = 1;
+					S = *E ? E+1 : E;
+				}
+			}
+			if( Hidden )
+				continue;
+
 			Texture->GetInfo( TextureMap, Viewport->CurrentTime );
 			TextureMap.Pan			= FVector( -PanU, -PanV, 0 );
 			Surface.Texture			= &TextureMap;
