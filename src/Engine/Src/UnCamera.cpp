@@ -444,10 +444,19 @@ UBOOL UViewport::Exec( const char* Cmd, FOutputDevice* Out )
 				IH.biClrImportant	= 0;
 				appFwrite( &IH, sizeof(IH), 1, F );
 
-				// Colors.
+				// Colors. x64 port: a 24-bit BI_RGB scanline is BLUE, GREEN,
+				// RED, but FColor is laid out R,G,B,A -- writing its first
+				// three bytes handed every screenshot to the viewer with red
+				// and blue swapped (brown rock came out blue, teal water came
+				// out olive). Write the channels in the order the format
+				// specifies.
 				for( INT i=SizeY-1; i>=0; i-- )
 					for( INT j=0; j<SizeX; j++ )
-						appFwrite( &Buf[i*SizeX+j], 3, 1, F );
+					{
+						FColor& C = Buf[i*SizeX+j];
+						BYTE Bgr[3] = { C.B, C.G, C.R };
+						appFwrite( Bgr, 3, 1, F );
+					}
 
 				// Success.
 				appFclose( F );
