@@ -1596,6 +1596,54 @@ static void MainLoop( UEngine* Engine )
 					EC ? "ok" : "'Effects' missing", M ? "ok" : ProbeMeshName );
 			}
 		}
+		// -probemusic: report what the level asks for and what the player was
+		// handed, then kick the music state machine. A level's Song reaches the
+		// player only through GameInfo.Login -> ClientSetMusic, so "no music on
+		// this map" is either a Song the map never set, a handoff that did not
+		// happen, or a module libxmp cannot decode -- and these three look
+		// identical from inside the game.
+		{
+			static UBOOL MusicInfo = ParseParam( appCmdLine(), "PROBEMUSIC" );
+			static INT MusicLogged = 0;
+			UGameEngine* GM = Cast<UGameEngine>( Engine );
+			if( MusicInfo && GM && GM->GLevel && Engine->Client && MusicLogged<3 )
+			{
+				ALevelInfo* LI = GM->GLevel->GetLevelInfo();
+				for( INT v=0; v<Engine->Client->Viewports.Num(); v++ )
+				{
+					APlayerPawn* P = Engine->Client->Viewports(v)->Actor;
+					if( !P )
+						continue;
+					MusicLogged++;
+					debugf( NAME_Log, "MUSICPROBE level.Song=%s section=%i | player.Song=%s section=%i transition=%i",
+						(LI && LI->Song) ? LI->Song->GetPathName() : "NONE", LI ? (INT)LI->SongSection : -1,
+						P->Song ? P->Song->GetPathName() : "NONE", (INT)P->SongSection, (INT)P->Transition );
+					// -probemusic=<Package.Object> plays a named module instead of
+					// the level's. Maps that start SILENT (Vortex2, Dark,
+					// SkyBase, SkyTown, Veloraend all have Level.Song NONE and
+					// bring music in on a MusicEvent trigger) cannot be tested
+					// any other way -- the module never loads unless the player
+					// walks into the right trigger.
+					UMusic* Want = LI ? LI->Song : NULL;
+					char MusicName[128]="";
+					if( Parse( appCmdLine(), "PROBEMUSIC=", MusicName, ARRAY_COUNT(MusicName) ) && MusicName[0] )
+					{
+						UMusic* M = LoadObject<UMusic>( NULL, MusicName, NULL, LOAD_NoWarn|LOAD_KeepImports, NULL );
+						debugf( NAME_Log, "MUSICPROBE requested '%s' -> %s", MusicName, M ? M->GetPathName() : "LOAD FAILED" );
+						if( M )
+							Want = M;
+					}
+					// Force the handoff and a start, so a decode failure shows up
+					// as Galaxy's own "failed to load music" warning.
+					if( Want )
+					{
+						P->Song        = Want;
+						P->SongSection = 0;
+						P->Transition  = MTRAN_Instant;
+					}
+				}
+			}
+		}
 		if( ProbeWalk && Engine->Client )
 		{
 			UGameEngine* G = Cast<UGameEngine>( Engine );
