@@ -49,6 +49,7 @@
 	// AActor collision functions.
 	UPrimitive* GetPrimitive() const;
 	UBOOL IsOverlapping( const AActor *Other ) const;
+	UBOOL IsOverlappingExtent( const AActor *Other ) const;
 
 	// AActor general functions.
 	void BeginTouch(AActor *Other);

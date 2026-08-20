@@ -207,9 +207,52 @@ UBOOL AActor::IsOverlapping( const AActor* Other ) const
 	unguardSlow;
 }
 
+//
+// Return whether this actor overlaps another using the same BOX extent the
+// collision sweep uses, rather than the cylinder IsOverlapping tests.
+//
+// These two have to agree wherever a touch is begun by one and ended by the
+// other. MoveActor begins a touch from the swept line check, which tests the
+// actor's extent as a box (radius,radius,height); ending it on the stricter
+// cylinder test leaves a thin band -- widest on a 45 degree approach, where a
+// box of half-width R reaches R*sqrt(2) at the corner -- in which every move
+// begins a touch and then immediately ends it. Measured on SkyBase: 45.4 and
+// 46.6 units apart against a summed radius of 65, so the box says touching and
+// the cylinder says not, by a tenth of a unit. Each pass through that band is a
+// full Touch event, and a TriggerToggle door pulsed twice opens and shuts again.
+//
+UBOOL AActor::IsOverlappingExtent( const AActor* Other ) const
+{
+	guardSlow(AActor::IsOverlappingExtent);
+	debug(Other!=NULL);
+
+	if( !IsBrush() && !Other->IsBrush() && Other!=Level )
+	{
+		return
+			Abs(Location.X - Other->Location.X) < CollisionRadius + Other->CollisionRadius
+		&&	Abs(Location.Y - Other->Location.Y) < CollisionRadius + Other->CollisionRadius
+		&&	Abs(Location.Z - Other->Location.Z) < CollisionHeight + Other->CollisionHeight;
+	}
+	else
+	{
+		// As IsOverlapping: undetectable, so report not overlapping.
+		return 0;
+	}
+	unguardSlow;
+}
+
 /*-----------------------------------------------------------------------------
 	Actor touch minions.
 -----------------------------------------------------------------------------*/
+
+// -touchtrace logs every touch handoff and every untouch, with the gate values
+// each side tests. A proximity trigger that "does nothing" is usually firing
+// perfectly well and firing more than once: the swept move can clip a trigger
+// cylinder that the end-of-tick position does not overlap, so BeginTouch and
+// the untouch pass below undo each other, once per tick, for as long as the
+// player is inside that band. A TriggerToggle door pulsed twice opens and shuts
+// again and reads as broken. Nothing short of this log distinguishes the two.
+ENGINE_API UBOOL GTouchTrace = 0;
 
 static UBOOL TouchTo( AActor* Actor, AActor* Other )
 {
@@ -269,11 +312,52 @@ static UBOOL TouchTo( AActor* Actor, AActor* Other )
 		}
 	}
 
+	if( GTouchTrace )
+	{
+		// Read the exact gates Trigger.IsRelevant tests, at the instant of the
+		// handoff -- a value sampled a frame later is a different value.
+		INT Active=-1, TrigType=-1;
+		for( TFieldIterator<UProperty> It(Actor->GetClass()); It; ++It )
+		{
+			if( !appStricmp( It->GetName(), "bInitiallyActive" ) )
+			{
+				UBoolProperty* BP = Cast<UBoolProperty>( *It );
+				if( BP )
+					Active = (*(DWORD*)((BYTE*)Actor + BP->Offset) & BP->BitMask) ? 1 : 0;
+			}
+			else if( !appStricmp( It->GetName(), "TriggerType" ) )
+				TrigType = *((BYTE*)Actor + It->Offset);
+		}
+		APawn* OP = Cast<APawn>( Other );
+		debugf( NAME_Log, "TOUCHTRACE t=%.2f %s(%s) <- %s slot=%i active=%i type=%i otherIsPlayer=%i event=%s",
+			Actor->Level ? Actor->Level->TimeSeconds : -1.f,
+			Actor->GetName(), Actor->GetClass()->GetName(), Other->GetName(), Available,
+			Active, TrigType, OP ? (INT)OP->bIsPlayer : -1, *Actor->Event );
+	}
 	if( Available >= 0 )
 	{
 		// Make Actor touch TouchActor.
 		Actor->Touching[Available] = Other;
+		if( GTouchTrace && Actor->Event!=NAME_None && Actor->XLevel )
+			for( INT q=0; q<Actor->XLevel->Num(); q++ )
+			{
+				AActor* T = Actor->XLevel->Element(q);
+				if( T && T->Tag==Actor->Event )
+					debugf( NAME_Log, "TOUCHTRACE   target %s(%s) probeMask=%016I64X state=%s",
+						T->GetName(), T->GetClass()->GetName(),
+						T->GetMainFrame() ? T->GetMainFrame()->ProbeMask : 0,
+						(T->GetMainFrame() && T->GetMainFrame()->StateNode) ? T->GetMainFrame()->StateNode->GetName() : "None" );
+			}
 		Actor->eventTouch( Other );
+		if( GTouchTrace && Actor->Event!=NAME_None && Actor->XLevel )
+			for( INT q=0; q<Actor->XLevel->Num(); q++ )
+			{
+				AMover* T = Cast<AMover>( Actor->XLevel->Element(q) );
+				if( T && T->Tag==Actor->Event )
+					debugf( NAME_Log, "TOUCHTRACE   after %s key=%i savedTrigger=%s",
+						T->GetName(), (INT)T->KeyNum,
+						T->SavedTrigger ? T->SavedTrigger->GetName() : "None" );
+			}
 
 		// See if first actor did something that caused an UnTouch.
 		if( Actor->Touching[Available] != Other )
@@ -315,6 +399,13 @@ void AActor::EndTouch( AActor* Other, UBOOL NoNotifySelf )
 {
 	guard(AActor::EndTouch);
 	check(Other!=this);
+	if( GTouchTrace )
+		debugf( NAME_Log, "TOUCHTRACE t=%.2f ENDTOUCH %s(%s) -x- %s notifySelf=%i overlapping=%i | self loc=(%.1f,%.1f,%.1f) r=%.1f h=%.1f brush=%i | other loc=(%.1f,%.1f,%.1f) r=%.1f h=%.1f brush=%i",
+			Level ? Level->TimeSeconds : -1.f, GetName(), GetClass()->GetName(),
+			Other->GetName(), (INT)!NoNotifySelf, (INT)IsOverlapping(Other),
+			Location.X, Location.Y, Location.Z, CollisionRadius, CollisionHeight, (INT)IsBrush(),
+			Other->Location.X, Other->Location.Y, Other->Location.Z,
+			Other->CollisionRadius, Other->CollisionHeight, (INT)Other->IsBrush() );
 
 	// Notify Actor.
 	for( int i=0; i<ARRAY_COUNT(Touching); i++ )

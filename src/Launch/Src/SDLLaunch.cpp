@@ -25,6 +25,7 @@
 #endif
 
 extern CORE_API FGlobalPlatform GTempPlatform;
+extern ENGINE_API UBOOL GTouchTrace;	// -touchtrace: touch/untouch handoff log
 extern "C" {char GPackage[64]="Launch";}
 #if _WIN32
 // Core's Win32 appBaseDir reads this; the DLLs each set their own copy in
@@ -460,6 +461,221 @@ static void RunActorProbe( UEngine* Engine )
 		Logged++;
 	}
 	debugf( NAME_Log, "ACTORPROBE: %i actor(s) logged (filter '%s')", Logged, Filter );
+	unguard;
+}
+
+/*-----------------------------------------------------------------------------
+	Door probe (-probedoor).
+-----------------------------------------------------------------------------*/
+
+// Dumps the editable properties a class adds on top of Actor. Triggers,
+// Dispatchers and SpecialEvents are script-only classes with no C++ struct, so
+// reflection is the only way to read what they were authored with.
+static void DumpAddedProps( AActor* Act, const char* Indent )
+{
+	guard(DumpAddedProps);
+	char Line[1024];
+	Line[0] = 0;
+	for( TFieldIterator<UProperty> It( Act->GetClass() ); It; ++It )
+	{
+		UProperty* Prop = *It;
+		if( !(Prop->PropertyFlags & CPF_Edit) || Prop->ArrayDim!=1 )
+			continue;
+		// Skip everything Actor itself declares: the door-specific facts are
+		// what the subclass added, and Actor's ~200 properties bury them.
+		UClass* Owner = Prop->GetOwnerClass();
+		if( !Owner || AActor::StaticClass->IsChildOf(Owner) )
+			continue;
+		char Value[256]="";
+		Prop->ExportText( 0, Value, (BYTE*)Act, (BYTE*)Act, 1 );
+		if( appStrlen(Line)+appStrlen(Value)+appStrlen(Prop->GetName())+4 > ARRAY_COUNT(Line) )
+			break;
+		appSprintf( Line+appStrlen(Line), "%s=%s ", Prop->GetName(), Value );
+	}
+	if( Line[0] )
+		debugf( NAME_Log, "DOORPROBE %s%s", Indent, Line );
+	unguard;
+}
+
+// True if this actor can fire event E. Actor.Event is the usual channel, but
+// it is not the only one: a Dispatcher fires from OutEvents[8], a mover from
+// PlayerBumpEvent/BumpEvent. Scanning every name property except the ones that
+// name the actor itself catches all of them, which matters because "nothing
+// triggers this door" is only a real finding if the search was exhaustive.
+static UBOOL FiresEvent( AActor* Act, FName E )
+{
+	guard(FiresEvent);
+	if( E==NAME_None )
+		return 0;
+	for( TFieldIterator<UProperty> It( Act->GetClass() ); It; ++It )
+	{
+		UNameProperty* NP = Cast<UNameProperty>( *It );
+		if( !NP )
+			continue;
+		const char* N = NP->GetName();
+		// These name the actor or its script state, not something it fires.
+		if( !appStricmp(N,"Tag") || !appStricmp(N,"Group") || !appStricmp(N,"InitialState")
+		||  !appStricmp(N,"State") || !appStricmp(N,"AttachTag") || !appStricmp(N,"ReturnGroup") )
+			continue;
+		for( INT k=0; k<NP->ArrayDim; k++ )
+			if( *(FName*)((BYTE*)Act + NP->Offset + k*sizeof(FName)) == E )
+				return 1;
+	}
+	return 0;
+	unguard;
+}
+
+// One line of "who is this actor and what state is it sitting in".
+static void DumpActorIdentity( AActor* Act, const char* Indent, const char* Role, FVector From )
+{
+	// A proximity trigger only fires on Touch, so its reach -- and whether the
+	// player is already standing inside it -- is the fact that decides whether
+	// a door can still be made to open from where the save left the player.
+	FLOAT Dist2D = FVector( Act->Location.X-From.X, Act->Location.Y-From.Y, 0 ).Size();
+	UBOOL Inside = Act->bCollideActors
+		&& Dist2D <= Act->CollisionRadius
+		&& Abs(Act->Location.Z-From.Z) <= Act->CollisionHeight;
+	char Touch[128]="";
+	for( INT t=0; t<ARRAY_COUNT(Act->Touching); t++ )
+		if( Act->Touching[t] )
+			appSprintf( Touch+appStrlen(Touch), "%s ", Act->Touching[t]->GetName() );
+	debugf( NAME_Log, "DOORPROBE %s%s %s '%s' tag=%s event=%s state=%s(init=%s) dist=%.0f loc=(%.0f,%.0f,%.0f) collide=%i hidden=%i radius=%.0f height=%.0f playerInside=%i touching=[%s]",
+		Indent, Role, Act->GetClass()->GetName(), Act->GetName(),
+		*Act->Tag, *Act->Event,
+		(Act->GetMainFrame() && Act->GetMainFrame()->StateNode) ? Act->GetMainFrame()->StateNode->GetName() : "None",
+		*Act->InitialState,
+		(Act->Location-From).Size(),
+		Act->Location.X, Act->Location.Y, Act->Location.Z,
+		(INT)Act->bCollideActors, (INT)Act->bHidden,
+		Act->CollisionRadius, Act->CollisionHeight, (INT)Inside, Touch );
+}
+
+// -probedoor[=<substr>] explains why a door is not opening. A mover opens only
+// when something Trigger()s its Tag, so the answer is never in the mover alone:
+// it is in the chain of actors whose Event matches that Tag, and in whether
+// those actors are still alive and still in a state that can fire. This walks
+// that chain two levels deep for every mover near the player (or every mover
+// whose name/tag matches the filter) and prints what each link is holding.
+// Non-interactive: log, then exit.
+static void RunDoorProbe( UEngine* Engine )
+{
+	guard(RunDoorProbe);
+	UGameEngine* Game = Cast<UGameEngine>( Engine );
+	if( !Game || !Game->GLevel )
+	{
+		debugf( NAME_Log, "DOORPROBE: no level" );
+		return;
+	}
+	ULevel* Level = Game->GLevel;
+	char Filter[64]="";
+	Parse( appCmdLine(), "PROBEDOOR=", Filter, ARRAY_COUNT(Filter) );
+	FLOAT Radius = 1200.f;
+	Parse( appCmdLine(), "DOORRADIUS=", Radius );
+
+	// The player's position is the whole point of the default filter: a
+	// savegame is a report of "I am stuck HERE", and the door in question is
+	// the one being stared at.
+	FVector From(0,0,0);
+	AActor* Player = NULL;
+	for( INT i=0; i<Level->Num(); i++ )
+	{
+		APawn* P = Cast<APawn>( Level->Element(i) );
+		if( P && P->IsA(APlayerPawn::StaticClass) )
+		{
+			Player = P;
+			From   = P->Location;
+			break;
+		}
+	}
+	debugf( NAME_Log, "DOORPROBE player=%s at (%.0f,%.0f,%.0f) filter='%s' radius=%.0f",
+		Player ? Player->GetName() : "NONE", From.X, From.Y, From.Z, Filter, Radius );
+
+	// Which door is "the" door: trace out of the saved eye along the saved view,
+	// then fan the whole yaw circle. Distance to a mover's pivot is a poor proxy
+	// -- the pivot can sit far from the brush -- so let the collision code say
+	// what is actually in front of the player.
+	if( Player )
+	{
+		APawn* PP = Cast<APawn>( Player );
+		FVector Eye = From + FVector( 0, 0, PP ? PP->EyeHeight : 40.f );
+		FRotator View = PP && PP->IsA(APlayerPawn::StaticClass)
+			? ((APlayerPawn*)PP)->ViewRotation : Player->Rotation;
+		for( INT Step=-1; Step<24; Step++ )
+		{
+			FRotator R = View;
+			if( Step>=0 )
+				R = FRotator( 0, Step*(65536/24), 0 );
+			FCheckResult Hit(1.f);
+			FVector Dir = R.Vector();
+			if( !Level->SingleLineCheck( Hit, Player, Eye+Dir*4000.f, Eye, TRACE_VisBlocking ) )
+			{
+				AMover* HitMover = Cast<AMover>( Hit.Actor );
+				if( Step<0 || HitMover )
+					debugf( NAME_Log, "DOORPROBE look yaw=%i(%.0fdeg) -> %s '%s' at %.0f units%s",
+						(INT)R.Yaw, R.Yaw*360.f/65536.f,
+						Hit.Actor ? Hit.Actor->GetClass()->GetName() : "BSP",
+						Hit.Actor ? Hit.Actor->GetName() : "world",
+						(Hit.Location-Eye).Size(),
+						Step<0 ? "  <== SAVED VIEW DIRECTION" : "" );
+			}
+			else if( Step<0 )
+				debugf( NAME_Log, "DOORPROBE look yaw=%i -> nothing within 4000 units  <== SAVED VIEW DIRECTION", (INT)R.Yaw );
+		}
+	}
+
+	INT Doors = 0;
+	for( INT i=0; i<Level->Num(); i++ )
+	{
+		AMover* M = Cast<AMover>( Level->Element(i) );
+		if( !M )
+			continue;
+		if( Filter[0] )
+		{
+			if( !appStrfind( const_cast<char*>(M->GetName()), Filter )
+			&&  !appStrfind( const_cast<char*>(*M->Tag), Filter ) )
+				continue;
+		}
+		else if( !Player || (M->Location-From).Size() > Radius )
+			continue;
+		Doors++;
+
+		DumpActorIdentity( M, "", "MOVER", From );
+		debugf( NAME_Log, "DOORPROBE   keys=%i/%i prev=%i triggerOnce=%i slave=%i useTriggered=%i damageTriggered=%i bump=%i encroach=%i numTriggerEvents=%i stayOpen=%.1f moveTime=%.1f",
+			(INT)M->KeyNum, (INT)M->NumKeys, (INT)M->PrevKeyNum,
+			(INT)M->bTriggerOnceOnly, (INT)M->bSlave, (INT)M->bUseTriggered, (INT)M->bDamageTriggered,
+			(INT)M->BumpType, (INT)M->MoverEncroachType, M->numTriggerEvents, M->StayOpenTime, M->MoveTime );
+		debugf( NAME_Log, "DOORPROBE   playerBumpEvent=%s bumpEvent=%s returnGroup=%s savedTrigger=%s triggerActor=%s leader=%s follower=%s",
+			*M->PlayerBumpEvent, *M->BumpEvent, *M->ReturnGroup,
+			M->SavedTrigger  ? M->SavedTrigger->GetName()  : "None",
+			M->TriggerActor  ? M->TriggerActor->GetName()  : "None",
+			M->Leader        ? M->Leader->GetName()        : "None",
+			M->Follower      ? M->Follower->GetName()      : "None" );
+
+		// Level one: everything that fires this mover's Tag.
+		INT Sources = 0;
+		for( INT j=0; j<Level->Num(); j++ )
+		{
+			AActor* T = Level->Element(j);
+			if( !T || T==M || !FiresEvent( T, M->Tag ) )
+				continue;
+			Sources++;
+			DumpActorIdentity( T, "  ", "<-fired-by", From );
+			DumpAddedProps( T, "    " );
+			// Level two: what fires THAT. A dead or dormant link here is the
+			// usual reason a door stays shut with nothing obviously wrong.
+			for( INT k=0; k<Level->Num(); k++ )
+			{
+				AActor* T2 = Level->Element(k);
+				if( !T2 || T2==T || T->Tag==NAME_None || !FiresEvent( T2, T->Tag ) )
+					continue;
+				DumpActorIdentity( T2, "    ", "<-fired-by", From );
+				DumpAddedProps( T2, "      " );
+			}
+		}
+		if( !Sources )
+			debugf( NAME_Log, "DOORPROBE   <-fired-by NOTHING (no actor in the level has Event=%s)", *M->Tag );
+	}
+	debugf( NAME_Log, "DOORPROBE: %i mover(s) reported", Doors );
 	unguard;
 }
 
@@ -1705,8 +1921,77 @@ static void MainLoop( UEngine* Engine )
 					P->Acceleration = Dir * P->AccelRate;
 				}
 				if( ( FrameNum % 25 )==0 || FrameNum==ProbeFrames-1 )
-					debugf( NAME_Log, "%s: frame %3i at (%.0f,%.0f,%.0f)",
-						ProbeStand ? "PROBESTAND" : "PROBEWALK", FrameNum, P->Location.X, P->Location.Y, P->Location.Z );
+						debugf( NAME_Log, "%s: frame %3i at (%.0f,%.0f,%.0f) class=%s bIsPlayer=%i intelligence=%i instigator=%s",
+							ProbeStand ? "PROBESTAND" : "PROBEWALK", FrameNum, P->Location.X, P->Location.Y, P->Location.Z,
+							P->GetClass()->GetName(), (INT)P->bIsPlayer, (INT)P->Intelligence,
+							P->Instigator ? P->Instigator->GetName() : "None" );
+					// Report any door that left its closed keyframe while walking:
+					// the only way to tell a "the trigger never fired" door from a
+					// "the trigger fired and the door moved" one is to walk the real
+					// player path and watch the movers, not the triggers.
+					if( ( FrameNum % 25 )==0 || FrameNum==ProbeFrames-1 )
+						for( INT m=0; m<G->GLevel->Num(); m++ )
+						{
+							AMover* Mv = Cast<AMover>( G->GLevel->Element(m) );
+							if( Mv && ( Mv->KeyNum!=0 || Mv->PrevKeyNum!=0
+								|| (Mv->Location-P->Location).Size()<600.f ) )
+								debugf( NAME_Log, "PROBEWALK   frame %3i door %s (%s) state=%s key=%i prev=%i savedTrigger=%s loc=(%.0f,%.0f,%.0f)",
+									FrameNum, Mv->GetName(), *Mv->Tag,
+									(Mv->GetMainFrame() && Mv->GetMainFrame()->StateNode) ? Mv->GetMainFrame()->StateNode->GetName() : "None",
+									(INT)Mv->KeyNum, (INT)Mv->PrevKeyNum,
+									Mv->SavedTrigger ? Mv->SavedTrigger->GetName() : "None",
+									Mv->Location.X, Mv->Location.Y, Mv->Location.Z );
+						}
+					// And the triggers themselves: a door that never moves is either a
+					// trigger that never saw the player, or one that saw him and
+					// declined. Touching[] tells those two apart, and nothing else does.
+					if( ( FrameNum % 25 )==0 || FrameNum==ProbeFrames-1 )
+						for( INT t=0; t<G->GLevel->Num(); t++ )
+						{
+							AActor* Tr = G->GLevel->Element(t);
+							if( !Tr || !Tr->IsA(ATrigger::StaticClass) )
+								continue;
+							FLOAT D = (Tr->Location-P->Location).Size();
+							if( D > 300.f )
+								continue;
+							char Touch[128]="";
+							for( INT k=0; k<ARRAY_COUNT(Tr->Touching); k++ )
+								if( Tr->Touching[k] )
+									appSprintf( Touch+appStrlen(Touch), "%s ", Tr->Touching[k]->GetName() );
+							debugf( NAME_Log, "PROBEWALK   frame %3i trigger %s (tag=%s event=%s) dist=%.0f radius=%.0f height=%.0f collide=%i touching=[%s]",
+								FrameNum, Tr->GetName(), *Tr->Tag, *Tr->Event, D,
+								Tr->CollisionRadius, Tr->CollisionHeight, (INT)Tr->bCollideActors, Touch );
+							// LIVE gate values: bInitiallyActive is toggled at runtime, so the
+							// value the map was authored with says nothing about whether the
+							// trigger will answer the player standing on it right now.
+							DumpAddedProps( Tr, "     " );
+						}
+					// -probeforcetouch=<TriggerName> calls that trigger's Touch by hand at
+					// frame 60. If the door then opens, the trigger's own logic is fine and
+					// the engine never delivered the touch; if it stays shut, the script
+					// declined the player. Nothing else separates those two.
+					{
+						static char ForceName[64]="";
+						static UBOOL ForceParsed = 0, Forced = 0;
+						if( !ForceParsed )
+						{
+							ForceParsed = 1;
+							Parse( appCmdLine(), "PROBEFORCETOUCH=", ForceName, ARRAY_COUNT(ForceName) );
+						}
+						if( ForceName[0] && !Forced && FrameNum>=60 )
+						{
+							Forced = 1;
+							for( INT t=0; t<G->GLevel->Num(); t++ )
+							{
+								AActor* Tr = G->GLevel->Element(t);
+								if( Tr && !appStricmp( Tr->GetName(), ForceName ) )
+								{
+									debugf( NAME_Log, "PROBEWALK   forcing %s->Touch(%s)", Tr->GetName(), P->GetName() );
+									Tr->eventTouch( P );
+								}
+							}
+						}
+					}
 				}
 			}
 			// -probeshotevery=N applies here too, not just to the pinned view:
@@ -2213,6 +2498,12 @@ int main( int argc, char** argv )
 			if( !GIsRequestingExit && ParseParam( appCmdLine(), "PROBEACTORS" ) )
 			{
 				RunActorProbe( Engine );
+				GIsRequestingExit = 1;
+			}
+			GTouchTrace = ParseParam( appCmdLine(), "TOUCHTRACE" );
+			if( !GIsRequestingExit && ParseParam( appCmdLine(), "PROBEDOOR" ) )
+			{
+				RunDoorProbe( Engine );
 				GIsRequestingExit = 1;
 			}
 			if( !GIsRequestingExit && ParseParam( appCmdLine(), "PROBETEX" ) )

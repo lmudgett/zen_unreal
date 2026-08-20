@@ -993,9 +993,12 @@ UBOOL ULevel::MoveActor
 				&&	(!Actor->IsBlockedBy(Test->Actor)) )
 					Actor->BeginTouch( Test->Actor );
 
-		// UnTouch notifications.
+		// UnTouch notifications. Tested against the same box extent the sweep
+		// above begins touches with -- the cylinder test is stricter, and the
+		// difference is a band the actor can sit in while every move begins a
+		// touch and this pass immediately ends it. See IsOverlappingExtent.
 		for( int i=0; i<ARRAY_COUNT(Actor->Touching); i++ )
-			if( Actor->Touching[i] && !Actor->IsOverlapping(Actor->Touching[i]) )
+			if( Actor->Touching[i] && !Actor->IsOverlappingExtent(Actor->Touching[i]) )
 				Actor->EndTouch( Actor->Touching[i], 0 );
 	}
 
@@ -1078,9 +1081,9 @@ UBOOL ULevel::CheckEncroachment
 	// If bTouchNotify, send Touch and UnTouch notifies.
 	if( bTouchNotify )
 	{
-		// UnTouch notifications.
+		// UnTouch notifications -- same box extent the BeginTouch below uses.
 		for( int i=0; i<ARRAY_COUNT(Actor->Touching); i++ )
-			if( Actor->Touching[i] && !Actor->IsOverlapping(Actor->Touching[i]) )
+			if( Actor->Touching[i] && !Actor->IsOverlappingExtent(Actor->Touching[i]) )
 				Actor->EndTouch( Actor->Touching[i], 0 );
 	}
 
