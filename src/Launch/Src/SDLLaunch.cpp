@@ -453,6 +453,18 @@ static void RunActorProbe( UEngine* Engine )
 			(INT)( Zone && Zone->bFogZone ),
 			Zone ? (INT)Zone->FogColor.R : 0, Zone ? (INT)Zone->FogColor.G : 0, Zone ? (INT)Zone->FogColor.B : 0,
 			Zone ? Zone->FogDistance : 0.f );
+		// Mover facts: a mover is lit from its OWN brush's baked light data
+		// (Brush->Lights/LightBits, indexed per poly), so a mover whose brush
+		// carries none draws black in any zone with zero ambient.
+		if( AMover* M = Cast<AMover>(Act) )
+			debugf( NAME_Log, "ACTORPROBE     ^ mover brush=%s polys=%i lightmap=%i lights=%i lightbits=%i dynlight=%i leaf=%i leaves=%i keys=%i",
+				M->Brush ? M->Brush->GetName() : "None",
+				M->Brush && M->Brush->Polys ? M->Brush->Polys->Num() : -1,
+				M->Brush ? M->Brush->LightMap.Num() : -1,
+				M->Brush ? M->Brush->Lights.Num() : -1,
+				M->Brush ? M->Brush->LightBits.Num() : -1,
+				(INT)M->bDynamicLightMover, (INT)M->Region.iLeaf,
+				Level->Model ? Level->Model->Leaves.Num() : -1, (INT)M->NumKeys );
 		// Light facts: which lights SHOULD reach a surface is the first
 		// question when one draws black.
 		if( Act->LightType!=LT_None )

@@ -2119,7 +2119,7 @@ void FLightManager::SetupForSurf
 	}
 	static TArray<INT> ProbeSeen;
 	UBOOL ProbeThis = 0;
-	if( HaveProbe && Draw->iSurf < Level->Model->Surfs->Num() )
+	if( HaveProbe && Draw->iSurf < Level->Model->Surfs->Max() )
 	{
 		FBspSurf& PS = Level->Model->Surfs->Element(Draw->iSurf);
 		const char* PN = PS.Texture ? PS.Texture->GetName() : "None";
@@ -2135,6 +2135,12 @@ void FLightManager::SetupForSurf
 	AMover* Mover           = (Draw->iSurf < Level->Model->Surfs->Num()) ? NULL : (AMover*)Level->Model->Surfs->Element(Draw->iSurf).Actor;
 	UModel* Model			= Mover ? Mover->Brush : Level->Model;
 	FLightMapIndex* Index	= &Model->LightMap(iLightMap);
+	if( ProbeThis && Mover )
+		debugf( NAME_Log, "LIGHTMAPPROBE MOVER %s brush=%s iLightMap=%i LightMap.Num=%i Lights.Num=%i LightBits.Num=%i polys=%i idx: DataOffset=%i iLightActors=%i clamp=%ix%i scale=%.2fx%.2f pan=(%.1f,%.1f)",
+			Mover->GetName(), Mover->Brush ? Mover->Brush->GetName() : "None", iLightMap,
+			Model->LightMap.Num(), Model->Lights.Num(), Model->LightBits.Num(),
+			Model->Polys ? Model->Polys->Num() : -1,
+			Index->DataOffset, Index->iLightActors, Index->UClamp, Index->VClamp, Index->UScale, Index->VScale, Index->Pan.X, Index->Pan.Y );
 	Zone					= Draw->Zone;
 	BYTE ZoneID				= Zone ? Zone->Region.ZoneNumber : 255;
 	LastLight				= FirstLight;
@@ -2166,7 +2172,18 @@ void FLightManager::SetupForSurf
 
 		unguard;
 	}*/
-	if( !Mover || !Mover->bDynamicLightMover )
+	// x64 port: a mover lights from its OWN brush's baked data, raytraced by
+	// the editor at BrushRaytraceKey -- key 0 unless the mapper said
+	// otherwise. Stairs that start sunk in the floor are raytraced sunk, so
+	// nothing reaches them and the brush ships with no light data at all;
+	// risen, in a zone with zero ambient, they drew as solid black
+	// (ExtremeLab's stair pyramid). The engine already knows how to light a
+	// mover without baked data -- the leaf-permeating lights it uses for
+	// bDynamicLightMover -- so a brush that carries NO light data takes that
+	// path too. Brushes with baked lighting are untouched.
+	UBOOL UseLeafLights = Mover && Mover->Region.iLeaf!=INDEX_NONE && Level->Model->Leaves.Num()
+		&& ( Mover->bDynamicLightMover || Model->Lights.Num()==0 );
+	if( !UseLeafLights )
 	{
 		guard(SetupNormalSurface);
 		Mover = NULL;
@@ -2184,7 +2201,7 @@ void FLightManager::SetupForSurf
 
 		unguard;
 	}
-	else if( Mover->Region.iLeaf!=INDEX_NONE && Level->Model->Leaves.Num() )
+	else
 	{
 		guard(SetupMoverSurface);
 
@@ -2621,8 +2638,8 @@ void FLightManager::SetupForSurf
 				INT L = ((D&255) + ((D>>8)&255) + ((D>>16)&255))/3;
 				Sum += L; N++; Mx = Max(Mx,L);
 			}
-		debugf( NAME_Log, "LIGHTMAPPROBE surf=%i tex=%s flags=%08X zone=%i ambient=%i map=%ix%i (clamp %ix%i) lights: static=%i dynamic=%i moving=%i iLightActors=%i mean=%.1f max=%i",
-			Draw->iSurf, TexName, S.PolyFlags, (INT)ZoneID, Zone ? (INT)Zone->AmbientBrightness : -1,
+		debugf( NAME_Log, "LIGHTMAPPROBE surf=%i%s tex=%s flags=%08X zone=%i ambient=%i map=%ix%i (clamp %ix%i) lights: static=%i dynamic=%i moving=%i iLightActors=%i mean=%.1f max=%i",
+			Draw->iSurf, Mover ? " MOVER" : "", TexName, S.PolyFlags, (INT)ZoneID, Zone ? (INT)Zone->AmbientBrightness : -1,
 			LightMap.USize, LightMap.VSize, LightMap.UClamp, LightMap.VClamp,
 			StaticLights, DynamicLights, MovingLights, Index->iLightActors,
 			N ? Sum/N : 0.0, Mx );
