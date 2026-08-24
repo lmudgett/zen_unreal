@@ -1398,10 +1398,31 @@ void UOpenGLRenderDevice::UploadTexture( FTextureInfo& Info, DWORD PolyFlags, UB
 		else if( Info.Format==TEXF_RGB32 )
 		{
 			// Raw 32-bit color (light maps, fog maps).
+			//
+			// x64 port: these are QUARTER-bright, not half. The light manager
+			// lays ambient down at AmbientVector*0.25 and every light is
+			// merged at the same scale, so 64 means "texture as painted" and
+			// the 7-bit ceiling of 127 is 2x overbright. The retail Glide
+			// driver (the reference for this version) uploads each map
+			// normalized to its MaxColor and draws it with a constant colour
+			// of 2*MaxColor -- 2x the stored value -- and its
+			// DST_COLOR/SRC_COLOR modulate doubles that again: 4x for light
+			// maps, and 2x additive for fog maps. This driver only had the
+			// blend's 2x, so every lit surface drew at half the brightness
+			// the mapper lit it to: dim rooms went to exact black (a wall
+			// lit to 3 out of 64 is 3*2/255 of a dark texture -- nothing),
+			// and meshes, lit by a separate vertex path, looked bright
+			// against the world. The missing 2x goes in here, saturating,
+			// which matches Glide's per-texel 2*B (B<=127 never clips).
 			INT N = Min( Count, SrcBytes/(INT)sizeof(FColor) );
 			appMemcpy( Dst, Src, N*sizeof(FColor) );
 			for( INT i=0; i<N; i++ )
+			{
+				Dst[i].R = (BYTE)Min( 2*(INT)Dst[i].R, 255 );
+				Dst[i].G = (BYTE)Min( 2*(INT)Dst[i].G, 255 );
+				Dst[i].B = (BYTE)Min( 2*(INT)Dst[i].B, 255 );
 				Dst[i].A = 255;
+			}
 		}
 		else
 		{
@@ -3178,7 +3199,8 @@ void UOpenGLRenderDevice::DrawComplexSurface( FSceneNode* Frame, FSurfaceInfo& S
 		}
 	}
 
-	// Pass 2: light map, 2x modulated (Unreal light maps are half-bright).
+	// Pass 2: light map, 2x modulated on top of the 2x baked in at upload
+	// (see SetTexture: Unreal light maps are quarter-bright, 4x total).
 	// Skipped when the base pass already folded the light map in (lit
 	// translucent surfaces -- see above).
 	if( Surface.LightMap && !LightDone )

@@ -440,7 +440,7 @@ static void RunActorProbe( UEngine* Engine )
 		// how to find an open-sky camera spot without guessing yaws (fog matters
 		// for effect rendering as well, so report it alongside).
 		AZoneInfo* Zone = Act->Region.Zone;
-		debugf( NAME_Log, "ACTORPROBE %-22s %-26s (%7.0f,%8.0f,%7.0f) rot=%i:%i corona=%i skin=%s mesh=%s collide=%i zone=%s sky=%i fog=%i",
+		debugf( NAME_Log, "ACTORPROBE %-22s %-26s (%7.0f,%8.0f,%7.0f) rot=%i:%i corona=%i skin=%s mesh=%s collide=%i zone=%s sky=%i fog=%i fogcol=%i,%i,%i fogdist=%.0f",
 			Act->GetClass()->GetName(), Act->GetName(),
 			Act->Location.X, Act->Location.Y, Act->Location.Z,
 			(INT)Act->Rotation.Pitch, (INT)Act->Rotation.Yaw,
@@ -450,7 +450,16 @@ static void RunActorProbe( UEngine* Engine )
 			(INT)Act->bCollideActors,
 			Zone ? Zone->GetName() : "None",
 			(INT)( Zone && Zone->SkyZone ),
-			(INT)( Zone && Zone->bFogZone ) );
+			(INT)( Zone && Zone->bFogZone ),
+			Zone ? (INT)Zone->FogColor.R : 0, Zone ? (INT)Zone->FogColor.G : 0, Zone ? (INT)Zone->FogColor.B : 0,
+			Zone ? Zone->FogDistance : 0.f );
+		// Light facts: which lights SHOULD reach a surface is the first
+		// question when one draws black.
+		if( Act->LightType!=LT_None )
+			debugf( NAME_Log, "ACTORPROBE     ^ light type=%i effect=%i bright=%i hue=%i sat=%i radius=%i period=%i special=%i dynamic=%i hidden=%i",
+				(INT)Act->LightType, (INT)Act->LightEffect, (INT)Act->LightBrightness, (INT)Act->LightHue,
+				(INT)Act->LightSaturation, (INT)Act->LightRadius, (INT)Act->LightPeriod,
+				(INT)Act->bSpecialLit, (INT)Act->bDynamicLight, (INT)Act->bHidden );
 		// Second line for anything that draws as a sprite: DrawType/Style/Texture
 		// are what decide the blend mode, and a sprite rendering as a flat opaque
 		// rectangle is exactly a Style that resolved to "no blend".

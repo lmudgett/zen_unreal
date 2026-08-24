@@ -2108,6 +2108,27 @@ void FLightManager::SetupForSurf
 	Frame					= InFrame;
 	Level					= Frame->Level;
 	INT iLightMap	        = Level->Model->Surfs->Element(Draw->iSurf).iLightMap;
+	// x64 port: per-light detail for -probelightmap (see the summary at the
+	// end of this function); decided here so the static-light loop can log.
+	static char ProbeBuf[64];
+	static UBOOL ProbeParsed = 0, HaveProbe = 0;
+	if( !ProbeParsed )
+	{
+		ProbeParsed = 1;
+		HaveProbe = Parse( appCmdLine(), "PROBELIGHTMAP=", ProbeBuf, ARRAY_COUNT(ProbeBuf) );
+	}
+	static TArray<INT> ProbeSeen;
+	UBOOL ProbeThis = 0;
+	if( HaveProbe && Draw->iSurf < Level->Model->Surfs->Num() )
+	{
+		FBspSurf& PS = Level->Model->Surfs->Element(Draw->iSurf);
+		const char* PN = PS.Texture ? PS.Texture->GetName() : "None";
+		if( ProbeBuf[0]=='*' || appStrfind( const_cast<char*>(PN), ProbeBuf ) )
+		{
+			INT k; for( k=0; k<ProbeSeen.Num() && ProbeSeen(k)!=Draw->iSurf; k++ );
+			if( k==ProbeSeen.Num() ) { ProbeSeen.AddItem( Draw->iSurf ); ProbeThis = 1; }
+		}
+	}
 	LevelInfo				= Level->GetLevelInfo();
 	Zone					= NULL;
 	TemporaryTablesBuilt	= 0;	
@@ -2426,6 +2447,37 @@ void FLightManager::SetupForSurf
 				ShadowMapGen( LightMap, Info->ShadowBits, ShadowMap );
 				Info->IlluminationMap = New<BYTE>(GMem,LightMap.UClamp*LightMap.VClamp);
 				Info->Effect.SpatialFxFunc( LightMap, Info, ShadowMap, Info->IlluminationMap );
+				if( ProbeThis )
+				{
+					DOUBLE ShSum=0, IlSum=0; INT IlMax=0;
+					for( INT v=0; v<LightMap.VClamp; v++ )
+						for( INT u=0; u<LightMap.UClamp; u++ )
+						{
+							ShSum += ShadowMap[v*ShadowMaskU*8+u];
+							INT I = Info->IlluminationMap[v*LightMap.UClamp+u];
+							IlSum += I; IlMax = Max(IlMax,I);
+						}
+					INT NN = LightMap.UClamp*LightMap.VClamp;
+					if( NN<=64 )
+					{
+						char Row[512]; Row[0]=0;
+						for( INT v=Info->MinV; v<Info->MaxV; v++ )
+						{
+							appStrcat( Row, "|" );
+							for( INT u=Info->MinU; u<Info->MaxU; u++ )
+							{
+								char T[16]; appSprintf( T, "%3i/%3i ", (INT)Info->IlluminationMap[v*LightMap.UClamp+u], (INT)ShadowMap[v*ShadowMaskU*8+u] );
+								appStrcat( Row, T );
+							}
+						}
+						debugf( NAME_Log, "LIGHTMAPPROBE       illum/shadow in clip: %s", Row );
+					}
+					debugf( NAME_Log, "LIGHTMAPPROBE    static %s: clip U%i..%i V%i..%i radius=%.0f diffuse=%.3f color=(%.2f,%.2f,%.2f) pal255=(%i,%i,%i) shadow mean=%.1f illum mean=%.1f max=%i",
+						Info->Actor->GetName(), Info->MinU, Info->MaxU, Info->MinV, Info->MaxV,
+						Info->Radius, Info->Diffuse, Info->FloatColor.R, Info->FloatColor.G, Info->FloatColor.B,
+						(INT)Info->Palette[255].R, (INT)Info->Palette[255].G, (INT)Info->Palette[255].B,
+						NN ? ShSum/NN : 0.0, NN ? IlSum/NN : 0.0, IlMax );
+				}
 				Merge( LightMap, Info->Actor->LightEffect, 0, Info, Stream, Stream );
 				Mark.Pop();
 			}
@@ -2550,6 +2602,66 @@ void FLightManager::SetupForSurf
 
 	// Set pointers.
 	LightMip.DataPtr = (BYTE*)Stream;
+
+	// x64 port: -probelightmap=<texture substring> logs, once per surface
+	// wearing a matching texture, the lights that reached it and the mean of
+	// the light map that came out -- the way to tell "no light listed for
+	// this surface" from "a light was listed but computed to nothing" when a
+	// wall draws black.
+	if( ProbeThis )
+	{
+		FBspSurf& S = Level->Model->Surfs->Element(Draw->iSurf);
+		const char* TexName = S.Texture ? S.Texture->GetName() : "None";
+		DOUBLE Sum=0; INT N=0, Mx=0;
+		DWORD* Px = (DWORD*)LightMip.DataPtr;
+		for( INT i=0; i<LightMap.VClamp; i++ )
+			for( INT j=0; j<LightMap.UClamp; j++ )
+			{
+				DWORD D = Px[i*LightMap.USize+j];
+				INT L = ((D&255) + ((D>>8)&255) + ((D>>16)&255))/3;
+				Sum += L; N++; Mx = Max(Mx,L);
+			}
+		debugf( NAME_Log, "LIGHTMAPPROBE surf=%i tex=%s flags=%08X zone=%i ambient=%i map=%ix%i (clamp %ix%i) lights: static=%i dynamic=%i moving=%i iLightActors=%i mean=%.1f max=%i",
+			Draw->iSurf, TexName, S.PolyFlags, (INT)ZoneID, Zone ? (INT)Zone->AmbientBrightness : -1,
+			LightMap.USize, LightMap.VSize, LightMap.UClamp, LightMap.VClamp,
+			StaticLights, DynamicLights, MovingLights, Index->iLightActors,
+			N ? Sum/N : 0.0, Mx );
+		if( N<=64 )
+		{
+			char Row[768]; Row[0]=0;
+			for( INT i=0; i<LightMap.VClamp; i++ )
+			{
+				appStrcat( Row, "|" );
+				for( INT j=0; j<LightMap.UClamp; j++ )
+				{
+					DWORD D = Px[i*LightMap.USize+j];
+					char T[24]; appSprintf( T, "%i,%i,%i ", (INT)(D&255), (INT)((D>>8)&255), (INT)((D>>16)&255) );
+					appStrcat( Row, T );
+				}
+			}
+			debugf( NAME_Log, "LIGHTMAPPROBE    composite: %s", Row );
+		}
+		if( Index->iLightActors != INDEX_NONE )
+		{
+			char Raw[512]; Raw[0]=0;
+			for( INT i=0; i<8 && Index->iLightActors+i < Model->Lights.Num(); i++ )
+			{
+				AActor* L = Model->Lights(Index->iLightActors+i);
+				char T[80]; appSprintf( T, "%s ", L ? L->GetName() : "NULL" );
+				appStrcat( Raw, T );
+				if( !L ) break;
+			}
+			debugf( NAME_Log, "LIGHTMAPPROBE    raw Lights[%i..] of %i: %s", Index->iLightActors, Model->Lights.Num(), Raw );
+		}
+		for( FLightInfo* Info = FirstLight; Info < LastLight; Info++ )
+		{
+			AActor* A = Info->Actor;
+			debugf( NAME_Log, "LIGHTMAPPROBE    light %s at (%.0f,%.0f,%.0f) type=%i effect=%i bright=%i radius=%i opt=%i static=%i shadowbits=%i",
+				A->GetName(), A->Location.X, A->Location.Y, A->Location.Z,
+				(INT)A->LightType, (INT)A->LightEffect, (INT)A->LightBrightness, (INT)A->LightRadius,
+				(INT)Info->Opt, (INT)A->bStatic, Info->ShadowBits!=NULL );
+		}
+	}
 
 	STAT(unclock(GStat.IllumTime));
 	unguard;
