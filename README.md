@@ -87,7 +87,7 @@ Notes:
 
 ```powershell
 System\ZenUnreal.exe              # play the game (SDL build)
-System\ZenUnreal.exe -selftest    # built-in suite: 32 checks (core layout pins, all 146 packages load, WAV parse)
+System\ZenUnreal.exe -selftest    # built-in suite: 33 checks (core layout pins, all 146 packages load, WAV parse)
 System\ucc.exe -make              # rebuild UnrealScript packages
 scripts\selftest.ps1              # full 5-stage suite: selftest, compiler, headless bots, renderer, audio meter
 scripts\botmatch-test.ps1         # headless dedicated-server botmatch with KILL/SCORE log parsing
