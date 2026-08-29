@@ -2123,7 +2123,7 @@ void FLightManager::SetupForSurf
 	{
 		FBspSurf& PS = Level->Model->Surfs->Element(Draw->iSurf);
 		const char* PN = PS.Texture ? PS.Texture->GetName() : "None";
-		if( ProbeBuf[0]=='*' || appStrfind( const_cast<char*>(PN), ProbeBuf ) )
+		if( ProbeBuf[0]=='*' || appStrfind( PN, ProbeBuf ) )
 		{
 			INT k; for( k=0; k<ProbeSeen.Num() && ProbeSeen(k)!=Draw->iSurf; k++ );
 			if( k==ProbeSeen.Num() ) { ProbeSeen.AddItem( Draw->iSurf ); ProbeThis = 1; }
@@ -2477,14 +2477,14 @@ void FLightManager::SetupForSurf
 					INT NN = LightMap.UClamp*LightMap.VClamp;
 					if( NN<=64 )
 					{
-						char Row[512]; Row[0]=0;
+						char Row[768]; Row[0]=0;
 						for( INT v=Info->MinV; v<Info->MaxV; v++ )
 						{
-							appStrcat( Row, "|" );
+							appStrncat( Row, "|", sizeof(Row) );
 							for( INT u=Info->MinU; u<Info->MaxU; u++ )
 							{
 								char T[16]; appSprintf( T, "%3i/%3i ", (INT)Info->IlluminationMap[v*LightMap.UClamp+u], (INT)ShadowMap[v*ShadowMaskU*8+u] );
-								appStrcat( Row, T );
+								appStrncat( Row, T, sizeof(Row) );
 							}
 						}
 						debugf( NAME_Log, "LIGHTMAPPROBE       illum/shadow in clip: %s", Row );
@@ -2645,27 +2645,27 @@ void FLightManager::SetupForSurf
 			N ? Sum/N : 0.0, Mx );
 		if( N<=64 )
 		{
-			char Row[768]; Row[0]=0;
+			char Row[1024]; Row[0]=0;
 			for( INT i=0; i<LightMap.VClamp; i++ )
 			{
-				appStrcat( Row, "|" );
+				appStrncat( Row, "|", sizeof(Row) );
 				for( INT j=0; j<LightMap.UClamp; j++ )
 				{
 					DWORD D = Px[i*LightMap.USize+j];
 					char T[24]; appSprintf( T, "%i,%i,%i ", (INT)(D&255), (INT)((D>>8)&255), (INT)((D>>16)&255) );
-					appStrcat( Row, T );
+					appStrncat( Row, T, sizeof(Row) );
 				}
 			}
 			debugf( NAME_Log, "LIGHTMAPPROBE    composite: %s", Row );
 		}
 		if( Index->iLightActors != INDEX_NONE )
 		{
-			char Raw[512]; Raw[0]=0;
+			char Raw[768]; Raw[0]=0;
 			for( INT i=0; i<8 && Index->iLightActors+i < Model->Lights.Num(); i++ )
 			{
 				AActor* L = Model->Lights(Index->iLightActors+i);
 				char T[80]; appSprintf( T, "%s ", L ? L->GetName() : "NULL" );
-				appStrcat( Raw, T );
+				appStrncat( Raw, T, sizeof(Raw) );
 				if( !L ) break;
 			}
 			debugf( NAME_Log, "LIGHTMAPPROBE    raw Lights[%i..] of %i: %s", Index->iLightActors, Model->Lights.Num(), Raw );

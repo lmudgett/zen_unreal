@@ -30,3 +30,6 @@ Crash.txt
 
 # ImGui editor window-layout state (written at editor exit)
 System/EdGui.ini
+
+# Ad-hoc package backups taken before a risky rebuild (local-only)
+*.bak-*

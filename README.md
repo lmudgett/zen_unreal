@@ -11,6 +11,17 @@ A working 64-bit port of the Unreal Engine v200 codebase (retail Unreal, May 199
 - Frame pacing fixed for modern hardware: `glFinish`-based pacing, VSync off by default, configurable `FrameRateLimit` (200 fps default). The cap matters — at ~1000 fps the original 1998 float physics breaks down (NaN guards added in `physWalking` regardless).
 - Audio restored faithfully: ambient light-flicker modulation, voice start-order fix (torches were 2–5× too loud in naive ports).
 
+### Renderer & gameplay fidelity
+The port started out rendering a visibly different game from the 1998 original. These are the corrections, each traced back to what the retail Glide/software renderers actually did:
+- **Light map brightness** — v200 light maps are *quarter*-bright (64 = "texture as painted", 127 = 2× overbright). Glide reached 4× via a 2× upload scale *and* a 2× modulate blend; this driver only had the blend, so every lit surface drew at half brightness and dim rooms went to exact black. The missing 2× is now baked in at upload.
+- **Movers with no baked lighting** — a mover lights from its own brush's raytraced data. Stairs raytraced while sunk in the floor ship with no light data at all and drew solid black once risen; such brushes now take the leaf-permeating-light path the engine already uses for `bDynamicLightMover`.
+- **Water & liquids** — translucent wavy/auto-panning surfaces with glints; standing sheets shaded as waterfalls (strands, gaps, foot froth); underwater `EndFlash` warp. Slime gets a per-pixel GLSL warp shader (per-vertex tessellation was tried first and strobed on mip flicker).
+- **Sky** — cloud churn: sky sheets auto-pan and warp at 1/8 game time. Sky frames are detected via the frame zone's `ASkyZoneInfo`, and sky surfaces are binned by normal rather than centroid.
+- **Effect sprites** — the near-black dither floor is gated out of translucent textures (bilinear + additive stacking turned it into bright rectangles over rocket smoke), small mips sample mip 0 only, and modulated textures are excluded from the brightness gamma bake — that last one was the hard-edged pale square at NyLeve's waterfall.
+- **Coronas** — lens flares occlude against real geometry via a `GetPixelDepth` depth readback instead of always drawing on top.
+- **Doors** — `TriggerToggle` doors no longer open and shut again in a single approach above ~60 fps (`BeginTouch` used a box extent while `UnTouch` used a cylinder, so a grazing approach fired `Touch` twice).
+- **Slope sliding** — the player stands still on ordinary walkable slopes; sliding now requires a low `ZoneGroundFriction` (the ice knob), as intended.
+
 ### UnrealScript compiler
 - `ucc -make` rebuilds all script packages from source; `ucc -remake=<Package>` does a code-only rebuild of one package.
 - `Core.u` and `UnrealI.u` ship rebuilt from source. Import-resolution work brought `-remake` warnings from 1756 down to 2.
@@ -83,6 +94,9 @@ scripts\botmatch-test.ps1         # headless dedicated-server botmatch with KILL
 ```
 
 Diagnostic flags: `-framestats` (frame pacing report), `-glcounts` (renderer surf/poly counters), `-log` (tee log to terminal).
+
+Beyond those, most fidelity fixes above shipped with a `-probe*` flag that reproduces the symptom or dumps the state it was diagnosed from — the fastest way back into a problem is usually the probe that found it. They come in two shapes: switches (`-probesurfs`, `-probeglstate`, `-probesounds`, `-probenochurn`, `-probenofall`, `-probenofogmap`, `-probeflatmod`, `-probetexdump`) and filters taking a substring (`-probelightmap=<texture>`, `-probelight=<name>`, `-probeactors[=<class>]`, `-probemesh=<name>`, `-probedoor=<name>`, `-probemusic[=<pkg.obj>]`, `-probeview=<x:y:z:pitch:yaw>`). Filters match on word boundaries. Run with `-log` to see the output live.
+
 
 ## Porting notes
 
